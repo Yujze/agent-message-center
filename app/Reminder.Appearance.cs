@@ -53,6 +53,7 @@ namespace JieShou {
     public sealed class HudColors {
         public readonly Color Start, End, Surface, Ink, Muted, Line, Hover, Accent, Action, OnAction;
         public readonly Color Chrome, Track, Selected, Divider, Unread, UnreadSurface;
+        public readonly Color InputInk, InputSurface, RunningInk, RunningSurface;
         public HudColors(HudAppearance a) {
             bool light = a.Theme == "云白", purple = a.Theme == "夜紫";
             Chrome = ColorTranslator.FromHtml(light ? "#F6F7FA" : purple ? "#292735" : "#1D3040");
@@ -60,6 +61,10 @@ namespace JieShou {
             Selected = ColorTranslator.FromHtml(light ? "#FFFFFF" : purple ? "#454052" : "#314B60");
             Unread = ColorTranslator.FromHtml(light ? "#315990" : "#B6D8FF");
             UnreadSurface = ColorTranslator.FromHtml(light ? "#DCEBFF" : "#293F5C");
+            InputInk = ColorTranslator.FromHtml(light ? "#7B3F12" : "#FFD29D");
+            InputSurface = ColorTranslator.FromHtml(light ? "#F8E6D3" : "#594039");
+            RunningInk = ColorTranslator.FromHtml(light ? "#344E63" : "#C3D9E9");
+            RunningSurface = ColorTranslator.FromHtml(light ? "#E1E9F0" : purple ? "#303543" : "#263D4B");
             Divider = ColorTranslator.FromHtml(light ? "#D8DDE5" : purple ? "#3A3749" : "#304457");
             Start = ColorTranslator.FromHtml(light ? "#F1F5FC" : purple ? "#302042" : "#15324B");
             End = ColorTranslator.FromHtml(light ? "#FFFFFF" : purple ? "#191C30" : "#101D30");
@@ -110,9 +115,8 @@ namespace JieShou {
             return String.Join(" · ",parts);
         }
         private Color PriorityColor() {
-            bool light = Appearance.Theme == "云白";
             if (Values.Length > 0 && !String.IsNullOrEmpty(Values[0]))
-                return ColorTranslator.FromHtml(light ? "#8B3B0D" : "#FFD29D");
+                return Colors.InputInk;
             if (Values.Length > 1 && !String.IsNullOrEmpty(Values[1]))
                 return Colors.Unread;
             return Colors.Accent;
@@ -146,21 +150,28 @@ namespace JieShou {
         private PillTally Tally(int metric) =>
             Appearance.PillMode=="丰富模式" && metric<Breakdown.Length ? Breakdown[metric] : null;
 
-        private int Metric(Graphics g,bool draw,int i,bool first,Font label,Font number,int x,int y,int height) {
-            bool highlighted = first && i<2;
-            Color ink = highlighted ? PriorityColor() : i<3 ? Colors.Ink : Colors.Muted;
+        private int MetricContent(Graphics g,bool draw,int i,Font label,Font number,Font small,int x,int y,int height) {
+            if (i>=3) {
+                x=Piece(g,draw,Values[i],small,Colors.Muted,x,y,height)+D(3);
+                return Piece(g,draw,Labels[i],small,Colors.Muted,x,y,height);
+            }
+            Color ink=i==0 ? Colors.InputInk : i==1 ? Colors.Unread : Colors.RunningInk;
+            x=Piece(g,draw,Values[i],number,ink,x,y,height)+D(4);
+            x=Piece(g,draw,Labels[i],label,ink,x,y,height);
             var tally = Tally(i);
-            // With one source its icon count is also the total. With several, keep the total at a glance.
-            if (tally==null || tally.ByAgent.Count!=1)
-                x=Piece(g,draw,Values[i],i<3 ? number : label,ink,x,y,height)+D(4);
-            x=Piece(g,draw,Labels[i],highlighted ? number : label,highlighted ? ink : Colors.Muted,x,y,height);
-            if (tally==null) return x;
+            if (tally==null || tally.Total==0) return x;
+            x+=D(6);
+            if (draw) {
+                using var separator=new Pen(Color.FromArgb(80,ink),Math.Max(1,D(1)));
+                int line=D(Appearance.Size-2), top=y+(height-line)/2;
+                g.DrawLine(separator,x,top,x,top+line);
+            }
             foreach (var entry in tally.ByAgent) {
                 x+=D(6);
                 string key=entry.Key=="Qoder" ? (Appearance.Theme=="云白" ? "qoder-light" : "qoder-dark") : entry.Key.ToLowerInvariant();
                 var icon=AgentIcons?[key] as Image;
                 if (icon!=null) {
-                    int size=D(Appearance.Size+1);
+                    int size=D(Appearance.Size);
                     if (draw) {
                         var state=g.Save();
                         g.InterpolationMode=InterpolationMode.HighQualityBicubic;
@@ -170,39 +181,48 @@ namespace JieShou {
                     }
                     x+=size;
                 } else {
-                    x=Piece(g,draw,entry.Key,label,Colors.Muted,x,y,height);
+                    x=Piece(g,draw,entry.Key,small,ink,x,y,height);
                 }
-                x=Piece(g,draw,entry.Value.ToString(),number,ink,x+D(3),y,height);
+                x=Piece(g,draw,entry.Value.ToString(),small,ink,x+D(2),y,height);
             }
             return x;
         }
 
         private Size LayoutMetrics(Graphics g,bool draw,int maxWidth) {
             using var label = new Font(Appearance.Family,D(Appearance.Size),FontStyle.Regular,GraphicsUnit.Pixel);
-            using var number = new Font(Appearance.Family,D(Appearance.Size+1),FontStyle.Bold,GraphicsUnit.Pixel);
-            int left=GripWidth, tail=D(39), gap=D(16), height=D(Appearance.Size+22);
-            int step=Math.Max(D(Appearance.Size+7),number.Height+D(2));
-            int x=left, y=0, widest=left;
+            using var number = new Font(Appearance.Family,D(Appearance.Size+2),FontStyle.Bold,GraphicsUnit.Pixel);
+            using var small = new Font(Appearance.Family,D(Appearance.Size-1),FontStyle.Regular,GraphicsUnit.Pixel);
+            int left=GripWidth, tail=D(32), inset=D(5);
+            int height=Math.Max(D(Appearance.Size+12),number.Height+D(2));
+            int x=left, y=inset, widest=left;
             bool first=true;
             if (Values.Length==0) widest=Piece(g,draw,Text,label,Colors.Ink,x,y,height);
             for (int i=0; i<Values.Length && i<Labels.Length; i++) {
                 if (String.IsNullOrEmpty(Values[i])) continue;
-                int width=Metric(g,false,i,first,label,number,0,0,height);
+                bool segment=i<3;
+                int padding=segment ? D(9) : 0, gap=segment ? D(4) : D(11);
+                int width=MetricContent(g,false,i,label,number,small,0,0,height)+2*padding;
                 if (!first) {
-                    if ((long)x+gap+width+tail > maxWidth) { x=left; y+=step; }
-                    else {
-                        if (draw) {
-                            using var dot=new SolidBrush(Colors.Muted);
-                            g.FillEllipse(dot,x+D(7),y+height/2-D(1),D(2),D(2));
-                        }
-                        x+=gap;
-                    }
+                    if ((long)x+gap+width+tail > maxWidth) { x=left; y+=height+D(4); }
+                    else x+=gap;
                 }
-                if (draw) Metric(g,true,i,first,label,number,x,y,height);
+                if (draw) {
+                    if (segment) {
+                        Color fill=i==0 ? Colors.InputSurface : i==1 ? Colors.UnreadSurface : Colors.RunningSurface;
+                        using var path=Outline(new RectangleF(x+.5f,y+.5f,width-1,height-1),D(8));
+                        using var brush=new SolidBrush(fill);
+                        g.FillPath(brush,path);
+                        if (first && Values[i]!="0") {
+                            using var edge=new Pen(Color.FromArgb(50,Colors.Ink),Math.Max(1,D(1)));
+                            g.DrawPath(edge,path);
+                        }
+                    }
+                    MetricContent(g,true,i,label,number,small,x+padding,y,height);
+                }
                 x+=width; widest=Math.Max(widest,x);
                 first=false;
             }
-            return new Size(widest+tail,y+height);
+            return new Size(widest+tail,y+height+inset);
         }
 
         public Size MeasureForWidth(int maxWidth) {
