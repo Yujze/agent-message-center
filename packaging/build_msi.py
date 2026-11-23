@@ -49,6 +49,10 @@ def write_source(stage, files, version):
     appdata = add(product, "StandardDirectory", Id="LocalAppDataFolder")
     programs = add(appdata, "Directory", Id="UserPrograms", Name="Programs")
     install = add(programs, "Directory", Id="INSTALLFOLDER", Name="Agent Message Center")
+    # Registry key paths identify per-user components, so remember their directory for maintenance.
+    folder_property = add(product, "Property", Id="INSTALLFOLDER", Secure="yes")
+    add(folder_property, "RegistrySearch", Id="InstalledFolder", Root="HKCU",
+        Key=r"Software\AgentMessageCenter\Installer", Name="InstallFolder", Type="raw")
     feature = add(product, "Feature", Id="AMC", Title="Agent Message Center", Level="1")
     dirs = {PurePosixPath("."): install}
     for path in sorted(files):
@@ -69,6 +73,8 @@ def write_source(stage, files, version):
         Target="[INSTALLFOLDER]AMC.exe", WorkingDirectory="INSTALLFOLDER")
     add(shortcut, "RegistryValue", Root="HKCU", Key=r"Software\AgentMessageCenter\Installer",
         Name="StartMenuShortcut", Type="integer", Value="1", KeyPath="yes")
+    add(shortcut, "RegistryValue", Root="HKCU", Key=r"Software\AgentMessageCenter\Installer",
+        Name="InstallFolder", Type="string", Value="[INSTALLFOLDER]")
     for node in dirs.values():
         add(shortcut, "RemoveFolder", Id="clean_" + node.get("Id"), Directory=node.get("Id"), On="uninstall")
     add(feature, "ComponentRef", Id="StartMenuShortcut")
