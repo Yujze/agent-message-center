@@ -4,11 +4,11 @@ Agent Message Center 是一个 Windows 桌面浮窗。写代码或处理文档�
 
 ## 下载与启动
 
-1. 在本仓库的 **Releases** 中下载 `AMC-v0.2.0-beta.1-windows-x64-portable.zip`。
-2. 把整个 ZIP 解压到一个普通文件夹，双击其中的 **AMC.exe**。PowerShell 和 Python 已包含在包内。
-3. 按住气泡图标可以移动浮窗。要退出，在系统托盘右键 AMC 图标，选择「退出」。
+**安装版**适合日常使用。双击 MSI 为当前用户安装，然后在开始菜单搜索「智能体消息中心」。需要卸载时，打开 Windows「设置 → 应用 → 已安装的应用」，找到 Agent Message Center。[下载 Windows x64 安装包](https://github.com/Yujze/agent-message-center/releases/download/v0.2.0-beta.1/AMC-v0.2.0-beta.1-windows-x64.msi)
 
-本版面向 Windows x64。每个发行 ZIP 附有同名的 `.sha256` 文件，下载后可通过 PowerShell 的 `Get-FileHash` 核对。
+**便携版**适合解压即用。把整个 ZIP 解压到一个文件夹，再双击其中的 `AMC.exe`。[下载 Windows x64 便携包](https://github.com/Yujze/agent-message-center/releases/download/v0.2.0-beta.1/AMC-v0.2.0-beta.1-windows-x64-portable.zip)
+
+两种包都包含 PowerShell 和 Python。按住气泡图标可移动浮窗，右键系统托盘里的 AMC 图标可退出。Release 附件中各有一份同名 `.sha256` 文件，可用 `Get-FileHash` 核对。[全部发布文件](https://github.com/Yujze/agent-message-center/releases/tag/v0.2.0-beta.1)
 
 ## 会话列表
 
@@ -36,6 +36,13 @@ pwsh -NoProfile -STA -File .\app\Start-Reminder.ps1 -CodexLocal
 
 ```powershell
 python .\packaging\build.py
+```
+
+MSI 使用同版本便携 ZIP 作为输入。将 WiX 4 安装到构建缓存后运行：
+
+```powershell
+dotnet tool install wix --version 4.0.6 --tool-path .\.cache\wix4
+python .\packaging\build_msi.py .\dist\AMC-v0.2.0-beta.1-windows-x64-portable.zip --wix .\.cache\wix4\wix.exe
 ```
 
 源码测试使用临时会话数据。在 `app/` 目录运行：
