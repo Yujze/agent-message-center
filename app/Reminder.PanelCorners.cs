@@ -47,16 +47,23 @@ namespace JieShou {
             this.host=host;
             host.LocationChanged+=Sync; host.VisibleChanged+=Sync; host.HandleDestroyed+=OwnerDestroyed;
         }
-        internal void Apply(int r,Color topColor,Color bottomColor,byte opacity) {
-            var next=host.ClientSize;
+        internal void Apply(Size next,int r,Color topColor,Color bottomColor,byte opacity) {
             r=Math.Min(r,Math.Min(next.Width,next.Height)/2);
-            if (r<=0) { Hide(); if (host.Region!=null) host.Region=null; return; }
+            if (r<=0) {
+                if (next==host.ClientSize) {
+                    if (host.Region!=null) host.Region=null;
+                } else if (host.Region==null || radius!=0 || size!=next) host.Region=new Region(new Rectangle(Point.Empty,next));
+                upper.Hide(); lower.Hide();
+                enabled=false; cut=null; size=next; radius=0;
+                return;
+            }
             bool reuse=cut!=null && size.Width==next.Width && r==radius && top==topColor && bottom==bottomColor && alpha==opacity;
             if (enabled && reuse && size==next) return;
             if (!reuse && !RenderStrips(next.Width,r,topColor,bottomColor,opacity)) {
                 cut=null;
                 Hide();
-                MetricPill.ShapeWindow(host,r);
+                using var fallback=MetricPill.Outline(new Rectangle(Point.Empty,next),r);
+                host.Region=new Region(fallback);
                 return;
             }
             using var shape=new GraphicsPath(FillMode.Winding);
@@ -99,7 +106,7 @@ namespace JieShou {
             upper.Place(host.Left,host.Top);
             lower.Place(host.Left,host.Top+size.Height-radius);
         }
-        internal void Hide() { enabled=false; upper.Hide(); lower.Hide(); }
+        internal void Hide() { enabled=false; size=Size.Empty; upper.Hide(); lower.Hide(); }
         private void OwnerDestroyed(object sender,EventArgs e) {
             enabled=false; cut=null;
             upper.Release(); lower.Release();

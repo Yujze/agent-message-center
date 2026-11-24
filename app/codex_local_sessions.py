@@ -1,4 +1,4 @@
-"""Read only session index metadata used by the local Windows HUD."""
+"""Read local session metadata and outstanding input requests for the Windows HUD."""
 from contextlib import closing
 import json
 import os
@@ -22,6 +22,55 @@ def catalog_time(fields, name):
     if name in fields:
         options.append(f"{name} * 1000")
     return "COALESCE(" + ", ".join(options + ["NULL"]) + ")" if options else "NULL"
+
+
+def codex_sync_input_pending(projected, path, offset, turn_id):
+    pending = {call for call, status in projected.items() if status == "inProgress"}
+    if not isinstance(path, str) or not isinstance(offset, int) or offset < 0:
+        return bool(pending)
+    log = Path(path)
+    if not log.is_absolute() or log.suffix.lower() != ".jsonl":
+        return bool(pending)
+    try:
+        with log.open("rb") as stream:
+            stream.seek(offset)
+            first = json.loads(stream.readline())
+            start = first.get("payload") if isinstance(first, dict) else None
+            if not (isinstance(start, dict) and first.get("type") == "event_msg"
+                    and start.get("type") == "task_started" and start.get("turn_id") == turn_id):
+                return bool(pending)
+            for line in stream:
+                if not (b'"request_user_input"' in line or (pending and b'"function_call_output"' in line)
+                        or b'"task_complete"' in line or b'"turn_aborted"' in line or b'"task_started"' in line):
+                    continue
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue  # The producer may still be appending the last record.
+                event = record.get("payload") if isinstance(record, dict) else None
+                if not isinstance(event, dict):
+                    continue
+                kind = event.get("type")
+                if record.get("type") == "event_msg":
+                    if kind == "task_started" and event.get("turn_id") != turn_id:
+                        return False
+                    if kind in ("task_complete", "turn_aborted") and event.get("turn_id", turn_id) == turn_id:
+                        return False
+                if record.get("type") != "response_item":
+                    continue
+                call = event.get("call_id")
+                if not isinstance(call, str) or not call:
+                    continue
+                if kind == "function_call" and event.get("name") == "request_user_input":
+                    # "completed" on the model's call means it finished emitting the question.
+                    # Only a tool result or a terminal projection resolves the request.
+                    if call not in projected or projected[call] == "inProgress":
+                        pending.add(call)
+                elif kind == "function_call_output":
+                    pending.discard(call)
+    except (OSError, ValueError, OverflowError):
+        pass  # Missing or rotated logs do not invalidate the desktop's projected requests.
+    return bool(pending)
 
 
 def codex_async_input_pending(db, tables, thread_id, turn_id):
@@ -95,15 +144,17 @@ def session_snapshot(codex_home):
     with closing(open_index(codex_home / "state_5.sqlite")) as db:
         fields = columns(db, "main", "threads")
         parent = "attached_thread_parent_id" if "attached_thread_parent_id" in fields else "NULL"
+        rollout = "threads.rollout_path" if "rollout_path" in fields else "NULL"
         created = catalog_time(fields, "created_at")
         updated = catalog_time(fields, "updated_at")
-        status = message = finished = unread = needs_input = "NULL"
+        status = message = finished = unread = offset = "NULL"
         joins = ""
         if {"thread_id", "first_unread_turn"} <= columns(db, "main", "thread_read_receipts"):
             joins += " LEFT JOIN thread_read_receipts rr ON rr.thread_id=threads.id"
             unread = "CASE WHEN rr.thread_id IS NOT NULL THEN NULLIF(TRIM(rr.first_unread_turn),'') IS NOT NULL END"
         history_available = False
         turn_id = "NULL"
+        sync_query = None
         async_tables = []
         try:
             history = (codex_home / "thread_history_1.sqlite").resolve().as_uri() + "?mode=ro"
@@ -116,6 +167,8 @@ def session_snapshot(codex_home):
                 status = "last.status"
                 if "turn_id" in turn_fields:
                     turn_id = "last.turn_id"
+                if "rollout_byte_offset" in turn_fields:
+                    offset = "last.rollout_byte_offset"
                 if "completed_at" in turn_fields:
                     finished = "CASE WHEN last.status='completed' THEN last.completed_at*1000 END"
             parts, requests = [], []
@@ -128,7 +181,7 @@ def session_snapshot(codex_home):
                 } <= keys:
                     requests.append(f"""SELECT item_id, COALESCE(updated_at_ordinal,rollout_ordinal) AS seq,
                         json_extract(item_json,'$.status') AS status FROM history.{table}
-                        WHERE thread_id=threads.id AND turn_id=last.turn_id AND item_type='dynamicToolCall'
+                        WHERE thread_id=?1 AND turn_id=?2 AND item_type='dynamicToolCall'
                         AND json_valid(item_json) AND json_extract(item_json,'$.tool')='request_user_input'""")
                 if not {"created_at_ms", "item_type", "rollout_ordinal", "thread_id"} <= keys:
                     continue
@@ -141,18 +194,17 @@ def session_snapshot(codex_home):
             if requests:
                 # Only a synchronous, still-open question in the current turn is evidence.
                 calls = " UNION ALL ".join(requests)
-                needs_input = f"""CASE WHEN last.status='inProgress' AND EXISTS (
-                    SELECT 1 FROM (SELECT status, ROW_NUMBER() OVER (
+                sync_query = f"""SELECT item_id, status FROM (SELECT item_id, status, ROW_NUMBER() OVER (
                         PARTITION BY item_id ORDER BY seq DESC, (status IN ('completed','failed')) DESC
-                    ) AS position FROM ({calls})) WHERE position=1 AND status='inProgress') THEN 1 END"""
+                    ) AS position FROM ({calls})) WHERE position=1"""
         except sqlite3.OperationalError:
             pass
         db.execute("BEGIN")
         rows = db.execute(f"""SELECT threads.id, {created}, {updated}, threads.name, {status}, {message},
-                              {finished}, {unread}, {needs_input}, {turn_id}, {parent} FROM threads {joins} WHERE archived=0 AND source='vscode'
+                              {finished}, {unread}, {turn_id}, {parent}, {rollout}, {offset} FROM threads {joins} WHERE archived=0 AND source='vscode'
                               ORDER BY updated_at DESC, id DESC""").fetchall()
         sessions = []
-        for ident, created_ms, updated_ms, name, turn, msg, finished_ms, unread_flag, waiting, active_turn, parent_id in rows:
+        for ident, created_ms, updated_ms, name, turn, msg, finished_ms, unread_flag, active_turn, parent_id, path, start in rows:
             try:
                 parsed = UUID(ident)
                 if str(parsed) != ident or not parsed.int:
@@ -160,8 +212,12 @@ def session_snapshot(codex_home):
             except (TypeError, ValueError, AttributeError):
                 continue
             turn = turn if turn in {"inProgress", "completed", "interrupted", "failed"} else "unknown"
-            if turn == "inProgress" and active_turn and not waiting and codex_async_input_pending(db, async_tables, ident, active_turn):
-                waiting = 1
+            waiting = None
+            if turn == "inProgress" and active_turn:
+                projected = dict(db.execute(sync_query, (ident, active_turn))) if sync_query else {}
+                if (codex_sync_input_pending(projected, path, start, active_turn)
+                        or codex_async_input_pending(db, async_tables, ident, active_turn)):
+                    waiting = 1
             sessions.append(dict(agent="Codex", id=ident, name=" ".join((name or "")[:80].split()), turn=turn,
                                  created=created_ms, message=msg or None, activity=max(msg or 0, created_ms or 0, finished_ms or 0),
                                  finished=finished_ms, unread=unread_flag, needsInput=waiting,
@@ -171,7 +227,7 @@ def session_snapshot(codex_home):
             if parent_id is not None:
                 sessions[-1]["parentId"] = parent_id
     set_codex_side_chat_roots(sessions)
-    summary = dict(total=len(sessions), running=sum(s["turn"] == "inProgress" for s in sessions),
+    summary = dict(total=len(sessions), running=sum(s["turn"] == "inProgress" and not s["needsInput"] for s in sessions),
                    completed=sum(s["turn"] == "completed" for s in sessions))
     if sessions and not history_available:
         summary.update(running=None, completed=None)

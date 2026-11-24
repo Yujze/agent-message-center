@@ -470,7 +470,6 @@ function Update-LocalHudWindow {
         $pill.Text = $compactText
         $pill.AccessibleName = if ($countsReady) { $pill.Caption($true) } else { $compactText }
         $pill.AccessibleDescription = "智能体消息中心 · $scopeText。待输入含审批，完成未读限最近 24 小时。拖动左侧消息握把移动浮窗，点击数字展开。"
-        $hudTips.SetToolTip($pill,"$($pill.AccessibleName)`n$($pill.AccessibleDescription) 进行中和已完成按当前筛选范围内所有页的会话状态计数。")
         $pill.LayoutDpi = $localDpi
         if ($expanded) {
             $header.Font = $hudFonts.Title

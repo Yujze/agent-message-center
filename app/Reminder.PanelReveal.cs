@@ -6,7 +6,7 @@ using System.Windows.Forms;
 
 namespace JieShou {
     // Both directions traverse the same timeline: 0 is the pill, 1 the live list.
-    // Resizing the HWND clips rows at their native scale without repainting a list bitmap.
+    // Lay out the live panel once; its window region exposes the rows as the curtain moves.
     internal sealed class PanelReveal : NativeWindow, IDisposable {
         private const int DurationMs = 290;
         private readonly Form host;
@@ -15,7 +15,7 @@ namespace JieShou {
         private readonly Control band;
         private readonly Timer timer = new Timer { Interval = 15 };
         private readonly Stopwatch clock = new Stopwatch();
-        private Rectangle pillBounds, panelBounds, segmentBounds;
+        private Rectangle pillBounds, panelBounds, segmentBounds, displayedBounds;
         private int pillRadius, panelRadius, segmentRadius, displayedRadius;
         private double phase, segmentPhase;
         private byte opacity;
@@ -57,6 +57,7 @@ namespace JieShou {
             if (!CapturePill(host.Bounds)) return;
             phase = 0;
             if (!PaintPill(host.Top)) { Cancel(); return; }
+            displayedBounds = pillBounds;
             displayedRadius = pillRadius;
             ChangeDirection(false);
             // The outgoing pill covers the surface switch and initial list layout.
@@ -68,7 +69,7 @@ namespace JieShou {
         internal bool RollUp(Rectangle bounds) {
             if (!host.Visible || !band.Visible || !SessionActivityAnimation.MotionAllowed) return false;
             if (Closing) return true;
-            if (!Active) { phase = 1; panelBounds = host.Bounds; displayedRadius = panelRadius; }
+            if (!Active) { phase = 1; displayedBounds = panelBounds = host.Bounds; displayedRadius = panelRadius; }
             if (!CapturePill(bounds)) return false;
             ChangeDirection(true);
             if (phase <= 0) Finish();
@@ -78,7 +79,7 @@ namespace JieShou {
 
         private void StartSegment() {
             segmentPhase = phase;
-            segmentBounds = host.Bounds;
+            segmentBounds = displayedBounds;
             segmentRadius = displayedRadius;
             clock.Restart();
         }
@@ -139,11 +140,17 @@ namespace JieShou {
         }
 
         private void Apply(Rectangle bounds, int r) {
-            if (host.Bounds != bounds) host.Bounds = bounds;
-            if (band.Width != bounds.Width) band.Width = bounds.Width;
+            var layout = new Rectangle(bounds.Location, panelBounds.Size);
+            if (host.Bounds != layout) host.Bounds = layout;
+            if (band.Width != layout.Width) band.Width = layout.Width;
+            var viewport = new Size(Math.Min(bounds.Width, layout.Width), Math.Min(bounds.Height, layout.Height));
             var colors = pill.Colors;
-            corners.Apply(r, colors.Chrome, bounds.Height <= band.Height ? colors.Chrome : colors.Surface,
+            corners.Apply(viewport, r, colors.Chrome, viewport.Height <= band.Height ? colors.Chrome : colors.Surface,
                 (byte)Math.Round(255 * host.Opacity));
+            // Paint exposed child regions in this frame. No RDW_INVALIDATE: rows already on screen stay intact.
+            if (Active && displayedBounds != bounds)
+                RedrawWindow(host.Handle, IntPtr.Zero, IntPtr.Zero, 0x0100 | 0x0080); // UPDATENOW | ALLCHILDREN
+            displayedBounds = bounds;
             displayedRadius = r;
         }
 
@@ -190,6 +197,7 @@ namespace JieShou {
             timer.Dispose();
         }
         [DllImport("user32")] private static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int w, int height, uint flags);
+        [DllImport("user32")] private static extern bool RedrawWindow(IntPtr hwnd, IntPtr rect, IntPtr region, uint flags);
         [DllImport("user32")] private static extern bool ShowWindow(IntPtr h, int command);
     }
 }

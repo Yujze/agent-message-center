@@ -312,6 +312,63 @@ class CodexLocalTests(unittest.TestCase):
             db.commit()
         self.assertEqual(rows()[self.c]["unread"],0)
 
+    def test_plan_questions_from_the_active_rollout(self):
+        log = self.home / "rollout-test.jsonl"
+
+        def append(record, kind, **fields):
+            with log.open("ab") as stream:
+                line = {"type": record, "payload": {"type": kind, **fields}}
+                stream.write(json.dumps(line).encode() + b"\n")
+
+        def ask(call):
+            append("response_item", "function_call", name="request_user_input", call_id=call, status="completed")
+
+        def check(waiting):
+            snapshot = session_snapshot(self.home)
+            row = next(r for r in snapshot["sessions"] if r["id"] == self.a)
+            self.assertEqual(bool(row["needsInput"]), waiting)
+            self.assertEqual(snapshot["summary"]["running"], 0 if waiting else 1)
+
+        append("event_msg", "task_started", turn_id="previous")
+        ask("old")
+        offset = log.stat().st_size
+        append("event_msg", "task_started", turn_id="active", collaboration_mode_kind="plan")
+        with closing(sqlite3.connect(self.home / "state_5.sqlite")) as db:
+            db.execute("alter table threads add column rollout_path")
+            db.execute("update threads set rollout_path=? where id=?", (str(log), self.a))
+            db.commit()
+        with closing(sqlite3.connect(self.home / "thread_history_1.sqlite")) as db:
+            db.execute("alter table thread_turns add column turn_id")
+            db.execute("alter table thread_turns add column rollout_byte_offset integer")
+            db.execute("update thread_turns set turn_id='active', rollout_byte_offset=? where status='inProgress'", (offset,))
+            db.commit()
+        check(False)
+        append("response_item", "message", role="user", text="request_user_input")
+        check(False)
+        ask("first")
+        check(True)
+        append("response_item", "function_call_output", call_id="first")
+        check(False)
+        ask("second")
+        ask("third")
+        append("response_item", "function_call_output", call_id="old")
+        append("response_item", "function_call_output", call_id="second")
+        with log.open("ab") as stream:
+            stream.write(b'{"type":"response_item","payload":{"type":"function_call_output",')
+        check(True)
+        with log.open("ab") as stream:
+            stream.write(b'"call_id":"third"}}\n')
+        check(False)
+        ask("outstanding")
+        append("event_msg", "turn_aborted", turn_id="active")
+        check(False)
+        log.unlink()
+        append("event_msg", "task_started", turn_id="different")
+        ask("other-turn-question")
+        check(False)
+        log.unlink()
+        check(False)
+
     def test_codex_async_questions_match_individual_replies(self):
         def row():
             return next(r for r in session_snapshot(self.home)["sessions"] if r["id"] == self.a)

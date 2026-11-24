@@ -8,6 +8,7 @@ while ($localView.Status -eq 'Loading' -and [datetime]::UtcNow -lt $deadline) {
 }
 if ($localView.Status -ne 'Ready' -or $localView.Rows.Count -ne 3) { throw '未从不同目录读取全部测试会话' }
 if ($expanded -or $localChrome.Pill.Text -notmatch '^进行中 1 · 任务 3 · 已完成 1$') { throw '收起状态缺少实际统计' }
+if ($hudTips.GetToolTip($localChrome.Pill)) { throw '收起的胶囊不应弹出悬停说明' }
 Add-Type -Path "$PSScriptRoot/Test-HudScrollBar.cs"
 $work = [Windows.Forms.Screen]::FromControl($window).WorkingArea
 Move-ReminderHud ($work.Left+40) ($work.Top+40) $work
@@ -84,6 +85,13 @@ if ($localChrome.Pill.Width -lt $localChrome.Pill.RequiredWidth() -or $localChro
 $localView.Rows = $savedRows
 Update-ReminderWindow
 $capsuleBounds=$window.Bounds
+function Get-RevealBounds {
+    if (!$window.Region) { return $window.Bounds }
+    $g=$window.CreateGraphics()
+    try { $clip=[Drawing.Rectangle]::Round($window.Region.GetBounds($g)) } finally { $g.Dispose() }
+    $clip.Offset($window.Location)
+    return $clip
+}
 function Wait-HudMotion {
     $watch=[Diagnostics.Stopwatch]::StartNew()
     while ($localChrome.Surface.IsRevealing -and $watch.ElapsedMilliseconds -lt 1600) {
@@ -95,16 +103,24 @@ function Wait-HudMotion {
 $localChrome.Pill.PerformClick()
 if ([JieShou.SessionActivityAnimation]::MotionAllowed) {
     if (!$localChrome.Surface.IsRevealing) { throw '点击胶囊没有开始展开' }
+    $canvas=$window.Size
+    $row=$list.Controls[0]
+    $rowHandle=$row.Handle
+    $rowBounds=$row.Bounds
     $heights=[Collections.Generic.List[int]]::new()
+    $heights.Add((Get-RevealBounds).Height)
+    $observe=[EventHandler]{ $h=(Get-RevealBounds).Height; if (!$heights.Contains($h)) { $heights.Add($h) } }
+    $window.add_RegionChanged($observe)
     $watch=[Diagnostics.Stopwatch]::StartNew()
     $refreshed=$false
     while ($localChrome.Surface.IsRevealing -and $watch.ElapsedMilliseconds -lt 1500) {
         [Windows.Forms.Application]::DoEvents()
         if ($window.Top -ne $capsuleBounds.Top) { throw '展开时标题栏离开了胶囊上边缘' }
-        if (!$heights.Contains($window.Height)) { $heights.Add($window.Height) }
+        if ($canvas -ne $window.Size -or $rowHandle -ne $row.Handle -or $rowBounds -ne $row.Bounds) { throw '卷帘展开时重新布局了列表' }
         if (!$refreshed -and $heights.Count -ge 2) { Update-ReminderWindow; $refreshed=$true }
         Start-Sleep -Milliseconds 4
     }
+    $window.remove_RegionChanged($observe)
     if ($localChrome.Surface.IsRevealing -or $heights.Count -lt 3 -or $heights[0] -ge $window.Height) { throw '展开跳过了中间帧或未能结束' }
     for ($i=1;$i -lt $heights.Count;$i++) { if ($heights[$i] -le $heights[$i-1]) { throw '刷新后展开高度倒退' } }
     $end=$window.Bounds
@@ -116,15 +132,15 @@ $header.PerformClick()
 if ([JieShou.SessionActivityAnimation]::MotionAllowed) {
     if (!$localChrome.Surface.IsRollingUp -or !$list.Visible) { throw '点击收起没有保留列表开始上卷' }
     $watch=[Diagnostics.Stopwatch]::StartNew()
-    while ($window.Height -gt ($panelBounds.Height+$capsuleBounds.Height)/2 -and $watch.ElapsedMilliseconds -lt 1200) {
+    while ((Get-RevealBounds).Height -gt ($panelBounds.Height+$capsuleBounds.Height)/2 -and $watch.ElapsedMilliseconds -lt 1200) {
         [Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 3
     }
-    $middle=$window.Bounds
+    $middle=Get-RevealBounds
     if (!$localChrome.Surface.IsRollingUp -or $middle.Height -le $capsuleBounds.Height) { throw '上卷没有经过中间高度' }
     Update-ReminderWindow
-    if ($window.Bounds -ne $middle) { throw '刷新打断了上卷' }
+    if ((Get-RevealBounds) -ne $middle) { throw '刷新打断了上卷' }
     $header.PerformClick()
-    if ($localChrome.Surface.IsRollingUp -or $window.Bounds -ne $middle) { throw '上卷中重新展开时窗口跳位' }
+    if ($localChrome.Surface.IsRollingUp -or (Get-RevealBounds) -ne $middle) { throw '上卷中重新展开时窗口跳位' }
     Wait-HudMotion
     if ($window.Bounds -ne $panelBounds -or !$list.Visible) { throw '反向展开后列表未恢复' }
     $header.PerformClick()
@@ -137,14 +153,14 @@ $localChrome.Pill.PerformClick()
 $watch=[Diagnostics.Stopwatch]::StartNew()
 while ($localChrome.Surface.IsRevealing -and $watch.ElapsedMilliseconds -lt 1500) {
     [Windows.Forms.Application]::DoEvents()
-    if (!$work.Contains($window.Bounds)) { throw '贴边展开超出了工作区' }
+    if (!$work.Contains((Get-RevealBounds))) { throw '贴边展开超出了工作区' }
     Start-Sleep -Milliseconds 4
 }
-if ($window.Top -ge $edgeBounds.Top -or $window.Right -ne $edgeBounds.Right -or !$work.Contains($window.Bounds)) { throw '屏幕底部展开方向或水平锚点错误' }
+if ($window.Top -ge $edgeBounds.Top -or $window.Right -ne $edgeBounds.Right -or !$work.Contains((Get-RevealBounds))) { throw '屏幕底部展开方向或水平锚点错误' }
 $header.PerformClick()
 while ($localChrome.Surface.IsRollingUp -and $watch.ElapsedMilliseconds -lt 2000) {
     [Windows.Forms.Application]::DoEvents()
-    if (!$work.Contains($window.Bounds)) { throw '贴边上卷超出了工作区' }
+    if (!$work.Contains((Get-RevealBounds))) { throw '贴边上卷超出了工作区' }
     Start-Sleep -Milliseconds 4
 }
 if ($window.Bounds -ne $edgeBounds) { throw '屏幕底部收起时胶囊位置变化' }
