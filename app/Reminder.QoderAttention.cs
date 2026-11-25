@@ -7,8 +7,12 @@ using System.Threading.Tasks;
 using System.Windows.Automation;
 
 namespace JieShou {
-    // Qoder exposes pending interactions on its native sidebar. Database receipts
-    // describe read state; the live waiting indicator is a separate signal.
+    public sealed class QoderSnapshot {
+        public Dictionary<string,string> Badges { get; } = new Dictionary<string,string>(StringComparer.Ordinal);
+        public long StartedAt { get; internal set; }
+    }
+
+    // Use only status elements belonging to a sidebar row with a chat link.
     public static class QoderAttention {
         private static readonly Regex ChatRoute = new Regex(@"^#/chat/([a-zA-Z0-9_-]{1,128})(?:\?|$)");
         private static readonly Condition Status = new PropertyCondition(AutomationElement.ControlTypeProperty,ControlType.StatusBar);
@@ -17,7 +21,7 @@ namespace JieShou {
         private static string SessionId(AutomationElement indicator) {
             var walker = TreeWalker.RawViewWalker;
             for (var node = indicator; node != null; node = walker.GetParent(node)) {
-                if (!node.Current.ClassName.Contains("group/work-directory-chat",StringComparison.Ordinal)) continue;
+                if (Array.IndexOf(node.Current.ClassName.Split(' '),"group/work-directory-chat") < 0) continue;
                 foreach (AutomationElement link in node.FindAll(TreeScope.Descendants,Link)) {
                     if (!link.TryGetCurrentPattern(ValuePattern.Pattern,out var value)) continue;
                     string url = ((ValuePattern)value).Current.Value;
@@ -30,28 +34,33 @@ namespace JieShou {
             }
             return null;
         }
-        internal static void ReadWindow(AutomationElement window, HashSet<string> waiting) {
+        internal static void ReadWindow(AutomationElement window, Dictionary<string,string> badges) {
             foreach (AutomationElement badge in window.FindAll(TreeScope.Descendants,Status)) {
-                // The waiting badge has role=status and text-warning in all locales.
-                if (Array.IndexOf(badge.Current.ClassName.Split(' '),"text-warning") < 0) continue;
+                var classes = new HashSet<string>(badge.Current.ClassName.Split(' '),StringComparer.Ordinal);
+                string state;
+                if (classes.Contains("text-warning")) state = "waiting";
+                else if (classes.Contains("text-text-tertiary") && classes.Contains("place-items-center") &&
+                         classes.Contains("pointer-events-none") && classes.Contains("size-4")) state = "running";
+                else continue;
                 var id = SessionId(badge);
-                if (id != null) waiting.Add(id);
+                if (id != null && (!badges.ContainsKey(id) || state == "waiting")) badges[id] = state;
             }
         }
-        public static Task<string[]> ReadAsync() => Task.Run(() => {
-            var waiting = new HashSet<string>(StringComparer.Ordinal);
+        public static Task<QoderSnapshot> ReadAsync() => Task.Run(() => {
+            var result = new QoderSnapshot();
             string install = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),"Programs","Qoder") + Path.DirectorySeparatorChar;
             foreach (var process in Process.GetProcessesByName("Qoder")) {
                 using (process) {
                     try {
                         if (process.MainWindowHandle == IntPtr.Zero || !process.MainModule.FileName.StartsWith(install,StringComparison.OrdinalIgnoreCase)) continue;
-                        ReadWindow(AutomationElement.FromHandle(process.MainWindowHandle),waiting);
+                        long start = new DateTimeOffset(process.StartTime).ToUnixTimeMilliseconds();
+                        if (result.StartedAt == 0 || start < result.StartedAt) result.StartedAt = start;
+                        ReadWindow(AutomationElement.FromHandle(process.MainWindowHandle),result.Badges);
                     } catch (Exception ex) when (ex is ElementNotAvailableException || ex is InvalidOperationException ||
                         ex is UnauthorizedAccessException || ex is System.ComponentModel.Win32Exception ||
                         ex is System.Runtime.InteropServices.COMException) { }
                 }
             }
-            var result = new string[waiting.Count]; waiting.CopyTo(result); Array.Sort(result,StringComparer.Ordinal);
             return result;
         });
     }

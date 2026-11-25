@@ -312,6 +312,121 @@ class CodexLocalTests(unittest.TestCase):
             db.commit()
         self.assertEqual(rows()[self.c]["unread"],0)
 
+    def test_unread_completion_when_history_refers_to_an_older_rollout(self):
+        log = self.home / "rollout-current.jsonl"
+        def append(kind, **fields):
+            record = {"type":"event_msg", "timestamp":"2025-01-01T00:00:00.125Z",
+                      "payload":{"type":kind, **fields}}
+            with log.open("ab") as stream:
+                stream.write(json.dumps(record).encode() + b"\n")
+        def current():
+            return next(r for r in session_snapshot(self.home)["sessions"] if r["id"] == self.b)
+        def header(ident):
+            log.write_text(json.dumps({"type":"session_meta","payload":{"id":ident}})+"\n",encoding="utf-8")
+        stamp = 1735689600125
+        with closing(sqlite3.connect(self.home / "state_5.sqlite")) as db:
+            db.execute("alter table threads add column rollout_path")
+            db.execute("update threads set rollout_path=? where id=?", (str(log),self.b))
+            db.execute("create table thread_read_receipts(thread_id,first_unread_turn,last_published_turn)")
+            db.execute("insert into thread_read_receipts values(?,'first','latest')", (self.b,))
+            db.commit()
+            header(self.b)
+            append("task_complete", turn_id="latest", last_agent_message="fixture")
+            row=current()
+            self.assertEqual((row["turn"],row["unread"],row["finished"],row["message"],row["activity"]),
+                             ("completed",1,stamp,stamp,stamp))
+            db.execute("update thread_read_receipts set first_unread_turn=NULL")
+            db.commit()
+            self.assertEqual((current()["turn"],current()["unread"]),("completed",0))
+            append("task_started", turn_id="newer")
+            self.assertIsNone(current()["finished"])
+            append("turn_aborted", turn_id="newer")
+            self.assertIsNone(current()["finished"])
+            append("task_complete", turn_id="some-other-turn")
+            self.assertIsNone(current()["finished"])
+            header(self.a)
+            append("task_complete", turn_id="latest")
+            self.assertIsNone(current()["finished"])
+            header(self.b)
+            append("task_complete", turn_id="latest")
+            with closing(sqlite3.connect(self.home / "thread_history_1.sqlite")) as history:
+                history.execute("alter table thread_turns add column started_at")
+                history.execute("update thread_turns set started_at=? where thread_id=?", (stamp//1000+1,self.b))
+                history.commit()
+            self.assertEqual(current()["turn"],"interrupted")
+
+    def test_parallel_turns_when_one_history_cursor_points_into_an_old_rollout(self):
+        log = self.home / "current.jsonl"
+        def append(record, payload):
+            with log.open("ab") as stream:
+                entry = dict(timestamp="2025-01-01T00:00:00.125Z", type=record, payload=payload)
+                stream.write(json.dumps(entry).encode() + b"\n")
+
+        def check(expected, running, waiting=None):
+            snapshot = session_snapshot(self.home)
+            active = [r["id"] for r in snapshot["sessions"] if r["turn"] == "inProgress" and not r["needsInput"]]
+            row = next(r for r in snapshot["sessions"] if r["id"] == self.b)
+            self.assertCountEqual(active, running)
+            self.assertEqual(snapshot["summary"]["running"], len(running))
+            self.assertEqual((row["turn"], row["needsInput"]), (expected, waiting))
+            return row
+
+        append("session_meta", {"id": self.b})
+        with closing(sqlite3.connect(self.home / "state_5.sqlite")) as db:
+            db.execute("alter table threads add column rollout_path")
+            db.execute("update threads set rollout_path=? where id=?", (str(log), self.b))
+            db.commit()
+        with closing(sqlite3.connect(self.home / "thread_history_1.sqlite")) as db:
+            db.execute("create table thread_history_projection_state(thread_id primary key,next_rollout_byte_offset)")
+            db.execute("insert into thread_history_projection_state values(?,?)", (self.b, 3000000))
+            db.execute("alter table thread_turns add column started_at")
+            db.execute("update thread_turns set started_at=100 where thread_id=?", (self.b,))
+            db.commit()
+            append("event_msg", {"type": "task_started", "turn_id": "new"})
+            append("response_item", {"type": "function_call_output", "output": "x" * 1100000})
+            row = check("inProgress", [self.a, self.b])
+            self.assertEqual((row["activity"], row["finished"], row["message"]), (1735689600125, None, None))
+            append("response_item", {"type": "function_call", "name": "request_user_input", "call_id": "ask"})
+            check("inProgress", [self.a], waiting=1)
+            append("response_item", {"type": "function_call_output", "call_id": "ask"})
+            check("inProgress", [self.a, self.b])
+            with log.open("ab") as stream:
+                stream.write(b'{"type":"event_msg","timestamp":"2025-01-01T00:01:00Z","payload":')
+            check("inProgress", [self.a, self.b])
+            with log.open("ab") as stream:
+                stream.write(b'{"type":"task_complete","turn_id":"new"}}\n')
+            self.assertEqual(check("completed", [self.a])["finished"], 1735689660000)
+
+            # The projection has caught up and remains authoritative at EOF.
+            db.execute("update thread_history_projection_state set next_rollout_byte_offset=?", (log.stat().st_size,))
+            db.execute("update thread_turns set status='completed' where thread_id=?", (self.b,))
+            db.commit()
+            check("completed", [self.a])
+            append("event_msg", {"type": "task_started", "turn_id": "next"})
+            check("inProgress", [self.a, self.b])
+            append("event_msg", {"type": "turn_aborted", "turn_id": "next"})
+            check("interrupted", [self.a])
+
+    def test_desktop_unread_only_uses_unambiguous_local_scope(self):
+        def unread():
+            return next(r["unread"] for r in session_snapshot(self.home)["sessions"] if r["id"]==self.c)
+        with closing(sqlite3.connect(self.home / ".codex-global-state.sqlite")) as db:
+            db.execute("create table settings(scope,key,value)")
+            def set_state(scopes):
+                value={"version":1,"unreadByIdentity":scopes,
+                       "legacyMigration":{"unreadThreadIdsByHostId":{"local":[self.c]}}}
+                db.execute("delete from settings")
+                db.execute("insert into settings values('global','electron-thread-read-state-v1',?)",(json.dumps(value),))
+                db.commit()
+            set_state({"account":{"local:one":[self.c]}})
+            self.assertEqual(unread(),1)
+            set_state({"account":{"local:one":[],"remote:two":[self.c]}})
+            self.assertIsNone(unread())
+            set_state({"account":{"local:one":[self.c],"local:two":[]}})
+            self.assertIsNone(unread())
+            set_state({"account":{"local:one":[self.c]},"another":{"local:one":[]}})
+            self.assertIsNone(unread())
+
     def test_plan_questions_from_the_active_rollout(self):
         log = self.home / "rollout-test.jsonl"
 
@@ -426,9 +541,27 @@ class CodexLocalTests(unittest.TestCase):
             db.execute("insert into chat_session_messages values('s','2','t2',2,'user','completed',50,50,'local')")
             db.commit()
             self.assertEqual((session()["turn"],session()["finished"]),("unknown",None))
+            buffer = app.with_name("chat-session-turn-payload-buffer.sqlite")
+            self.assertFalse(buffer.exists())
+            with closing(sqlite3.connect(buffer)) as staging:
+                staging.execute("create table active_turn_projection_items(session_id,turn_id,created_at)")
+                staging.execute("create table pending_turn_projections(session_id,turn_id)")
+                staging.executemany("insert into active_turn_projection_items values(?,?,?)",
+                    [("s","t1",5),("other","t2",6),("s","t2",51),("s","t2",52)])
+                staging.commit()
+                self.assertEqual(session()["bufferedSince"],51)
+                staging.execute("insert into pending_turn_projections values('s','t2')")
+                staging.commit()
+                self.assertNotIn("bufferedSince",session())
+                staging.execute("delete from pending_turn_projections")
+                staging.commit()
             db.execute("insert into chat_session_messages values('s','3','t2',3,'assistant','streaming',60,70,'local')")
             db.commit()
             self.assertEqual(session()["turn"],"inProgress")
+            db.execute("update chat_session_messages set status='completed' where message_id='3'")
+            db.commit()
+            self.assertEqual(session()["turn"],"completed")
+            self.assertNotIn("bufferedSince",session())
 
 
 if __name__ == "__main__":

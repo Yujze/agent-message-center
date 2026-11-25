@@ -18,9 +18,10 @@ function Set-LocalHudTypeScale([int]$Dpi) {
         Small = [Drawing.Font]::new($family,[single]([Math]::Max(11,$size-2.5)*$Dpi/96),[Drawing.FontStyle]::Regular,$pixels)
     }
     $header.Font = $hudFonts.Title
-    foreach ($c in $localChrome.Toggle,$localChrome.Settings,$localChrome.Prev,$localChrome.Next,$localChrome.Section) { $c.Font = $hudFonts.Body }
-    foreach ($b in $localChrome.Toggle,$localChrome.Settings,$localChrome.Range,$localChrome.Sort,$localChrome.Prev,$localChrome.Next) { $b.LayoutDpi = $Dpi }
+    foreach ($c in $localChrome.Toggle,$localChrome.Settings,$localChrome.Prev,$localChrome.Next,$localChrome.Section,$localChrome.AllSessions) { $c.Font = $hudFonts.Body }
+    foreach ($b in $localChrome.Toggle,$localChrome.Settings,$localChrome.Range,$localChrome.Sort,$localChrome.Prev,$localChrome.Next,$localChrome.AllSessions) { $b.LayoutDpi = $Dpi }
     $localChrome.Section.Font = $hudFonts.Name
+    foreach ($tab in $localChrome.ReminderFilters) { $tab.Font=$hudFonts.Body; $tab.LayoutDpi=$Dpi }
     $localChrome.Notice.Font = $localChrome.PageLabel.Font = $hudFonts.Small
     if ($previous) { foreach ($font in $previous.Values) { $font.Dispose() } }
 }
@@ -34,20 +35,45 @@ function Set-HudAppearance {
     foreach ($c in $localChrome.Band,$header,$localChrome.Settings,$localChrome.Toggle) {
         $c.BackColor = $hudColors.Chrome; $c.ForeColor = $hudColors.Ink
     }
-    $header.FlatAppearance.MouseOverBackColor = $hudColors.Hover
     $localChrome.Section.ForeColor = $hudColors.Muted
     foreach ($c in $localChrome.Prev,$localChrome.Next) {
         $c.BackColor = $hudColors.Surface; $c.ForeColor = $hudColors.Muted
     }
     $localChrome.PageLabel.ForeColor = $hudColors.Muted
     $localChrome.Notice.ForeColor = $hudColors.Muted
-    foreach ($b in $localChrome.Toggle,$localChrome.Settings,$localChrome.Range,$localChrome.Sort,$localChrome.Prev,$localChrome.Next) {
+    foreach ($b in $localChrome.Toggle,$localChrome.Settings,$localChrome.Range,$localChrome.Sort,$localChrome.Prev,$localChrome.Next,$localChrome.AllSessions) {
         $b.Palette = $hudColors
         $b.Invalidate()
     }
     $localChrome.Pill.Appearance = $appearance
     $localChrome.Pill.Colors = $hudColors
     $localChrome.Pill.BackColor = $hudColors.End
+}
+
+function Complete-LocalHudDrag([Drawing.Point]$Release) {
+    if (!$placement.Positioned -or $placement.Docked) { return }
+    $target=[Windows.Forms.Screen]::FromPoint($Release)
+    $previous=[JieShou.HudDock]::FromAnchor($placement.Anchor,$placement.Vertical)
+    $dock=[JieShou.HudDock]::At($Release,$target.WorkingArea,$previous.Edge)
+    $placement.Display=[JieShou.HudDisplayIds]::For($target.DeviceName)
+    $placement.Anchor=$dock.Anchor
+    $placement.Vertical=$dock.Vertical
+    $placement.Docked=$true
+    $placement.Positioned=$false
+    $localChrome.ExpansionSource=$null
+    Update-ReminderWindow
+    if (!$appearance.RememberPosition) {
+        if ($localChrome.AppearanceDialog) { $localChrome.AppearanceDialog.SetPositionSource($localChrome.Pill,$appearance.LastDrag,$dock) }
+        return
+    }
+    $saved = [JieShou.HudDragPosition]::new()
+    foreach ($key in 'Display','Right','Bottom','X','Y') { $saved.$key = $placement[$key] }
+    $saved.DockSlot=$placement.Anchor
+    $saved.Vertical=$placement.Vertical
+    $appearance.LastDrag = $saved
+    if ($localChrome.AppearanceDialog) { $localChrome.AppearanceDialog.SetPositionSource($localChrome.Pill,$saved,$dock) }
+    try { $appearance.Save($appearancePath) }
+    catch { Write-Warning "未能记住浮窗位置：$($_.Exception.Message)" }
 }
 
 function Show-HudAppearance {
@@ -57,12 +83,15 @@ function Show-HudAppearance {
         $editor.FocusEditor()
         return
     }
-    $editor = [JieShou.AppearanceDialog]::new($appearance,$localDpi,$agentIcons)
+    $version=Get-Content -LiteralPath (Join-Path $PSScriptRoot '../VERSION') -Raw -ErrorAction SilentlyContinue
+    $editor = [JieShou.AppearanceDialog]::new($appearance,$localDpi,$agentIcons,$version)
+    $editor.SetPositionSource($localChrome.Pill,$appearance.LastDrag,[JieShou.HudDock]::FromAnchor($placement.Anchor,$placement.Vertical))
     $localChrome.AppearanceDialog = $editor
     $localChrome.RestoreTopMost = $window.TopMost
     $editor.Add_FormClosing({
         param($sender,$e)
         if ($e.CloseReason -ne 'UserClosing' -or $sender.DialogResult -ne 'OK') { return }
+        $sender.Selection.LastDrag = $appearance.LastDrag
         try { $sender.Selection.Save($appearancePath) }
         catch {
             $e.Cancel = $true
@@ -70,13 +99,22 @@ function Show-HudAppearance {
             $sender.ShowSaveError()
             return
         }
+        if ($appearance.StartupDisplay -ne $sender.Selection.StartupDisplay -or
+            !$appearance.StartupDock.Equals($sender.Selection.StartupDock) -or
+            $appearance.RememberPosition -ne $sender.Selection.RememberPosition) {
+            $script:placement = Get-ReminderStartupPlacement $sender.Selection
+            $localChrome.ExpansionSource = $null
+        }
         $script:appearance = $sender.Selection
         Set-HudAppearance
         Update-ReminderWindow
     })
     $editor.Add_FormClosed({
         $localChrome.AppearanceDialog = $null
-        if (!$window.Disposing -and !$window.IsDisposed) { $window.TopMost = $localChrome.RestoreTopMost }
+        if (!$window.Disposing -and !$window.IsDisposed) {
+            $window.TopMost = $localChrome.RestoreTopMost
+            if ($appearance.AutoHide) { Update-ReminderWindow }
+        }
     })
     try {
         # Keep the editor above the HUD even when background refreshes move the HUD.
@@ -97,16 +135,18 @@ function Initialize-LocalHudTypes {
     $refs += (Get-ChildItem -LiteralPath ([IO.Path]::GetDirectoryName([Drawing.Graphics].Assembly.Location)) -Filter 'System.Private.Windows*.dll').FullName
     Add-Type -AssemblyName UIAutomationClient,UIAutomationTypes
     $refs += [Windows.Automation.AutomationElement].Assembly.Location, [Windows.Automation.ControlType].Assembly.Location
-    Add-Type -Path "$PSScriptRoot/Reminder.HudControls.cs","$PSScriptRoot/Reminder.ChoiceMenu.cs","$PSScriptRoot/Reminder.LocalRow.cs","$PSScriptRoot/Reminder.SessionListPanel.cs","$PSScriptRoot/Reminder.Appearance.cs","$PSScriptRoot/Reminder.PillWindowSurface.cs","$PSScriptRoot/Reminder.PanelCorners.cs","$PSScriptRoot/Reminder.PanelReveal.cs","$PSScriptRoot/Reminder.AppearanceDialog.cs","$PSScriptRoot/Reminder.AppearanceControls.cs","$PSScriptRoot/Reminder.QoderAttention.cs","$PSScriptRoot/Reminder.DshSidebar.cs","$PSScriptRoot/Reminder.ScrollBar.cs" -ReferencedAssemblies ($refs | Sort-Object -Unique)
+    Add-Type -Path "$PSScriptRoot/Reminder.HudGeometry.cs","$PSScriptRoot/Reminder.DisplayScale.cs","$PSScriptRoot/Reminder.HudControls.cs","$PSScriptRoot/Reminder.ChoiceMenu.cs","$PSScriptRoot/Reminder.LocalRow.cs","$PSScriptRoot/Reminder.SessionListPanel.cs","$PSScriptRoot/Reminder.Appearance.cs","$PSScriptRoot/Reminder.EdgeTabs.cs","$PSScriptRoot/Reminder.PillWindowSurface.cs","$PSScriptRoot/Reminder.PanelCorners.cs","$PSScriptRoot/Reminder.PanelReveal.cs","$PSScriptRoot/Reminder.OutsideClick.cs","$PSScriptRoot/Reminder.AppearanceDialog.cs","$PSScriptRoot/Reminder.AppearanceControls.cs","$PSScriptRoot/Reminder.QoderAttention.cs","$PSScriptRoot/Reminder.DshSidebar.cs","$PSScriptRoot/Reminder.ScrollBar.cs" -ReferencedAssemblies ($refs | Sort-Object -Unique)
 }
 
 function Initialize-LocalHudView {
-    $script:localScrollBar = [JieShou.HudScrollBar]::new($list)
     $script:appearancePath = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'DaiWoJieShou/appearance.json'
     $script:appearance = if ($UiTest) { [JieShou.HudAppearance]::new() } else { [JieShou.HudAppearance]::Load($appearancePath) }
+    $script:placement = Get-ReminderStartupPlacement $appearance
     # Assets are rasterized from the identically named SVGs in Token Monitor 0.96.1.
     # Qoder's currentColor layer follows the surface theme, preserving its fixed green.
     $script:agentIcons = @{}
+    $brandIcon = [Drawing.Icon]::new("$PSScriptRoot/assets/amc-message-grip.ico",128,128)
+    try { $agentIcons['amc']=$brandIcon.ToBitmap() } finally { $brandIcon.Dispose() }
     foreach ($name in 'codex','dsh','qoder-light','qoder-dark') {
         $stream = [IO.File]::OpenRead("$PSScriptRoot/assets/agent-icons/$name.png")
         try {
@@ -125,7 +165,7 @@ function Initialize-LocalHudView {
         }
         if ($_.KeyCode -eq 'Escape' -and $expanded) {
             $_.Handled = $true
-            $header.PerformClick()
+            Switch-ReminderExpansion
         }
     })
     $script:hudTips = [Windows.Forms.ToolTip]::new()
@@ -137,6 +177,7 @@ function Initialize-LocalHudView {
         Prev = [JieShou.HudButton]::new()
         Next = [JieShou.HudButton]::new()
         Section = [Windows.Forms.Label]::new()
+        AllSessions = [JieShou.HudButton]::new()
         PageLabel = [Windows.Forms.Label]::new()
         Notice = [Windows.Forms.Label]::new()
     }
@@ -156,6 +197,10 @@ function Initialize-LocalHudView {
         finally { $pen.Dispose() }
     })
     $window.Controls.Add($band)
+    $localChrome.OutsideClicks = [JieShou.OutsideClickDismissal]::new($band)
+    $localChrome.OutsideClicks.Add_OutsidePressed({
+        if ($expanded -and !$drag.Active -and !$localChrome.AppearanceDialog) { Switch-ReminderExpansion }
+    })
     $band.Controls.Add($header)
     $band.Controls.Add($localChrome.Toggle)
     $band.Controls.Add($localChrome.Settings)
@@ -167,11 +212,42 @@ function Initialize-LocalHudView {
     $localChrome.Surface = [JieShou.PillWindowSurface]::new($window,$localChrome.Pill,$dragGrip,$band)
     $localChrome.Surface.Add_RolledUp({ if (!$expanded) { Update-ReminderWindow } })
     $localChrome.Pill.ContextMenuStrip = $menu
-    $localChrome.Pill.Add_Click({ $script:expanded = $true; Update-ReminderWindow })
+    $localChrome.Pill.Add_Click({
+        if ($this.EdgeTab -and !$this.EdgePeek -and $this.ReminderCount -eq 0) {
+            Update-LocalDockHover $window.Location
+            return
+        }
+        Open-LocalSessionList $this.ClickedStatus
+    })
+    $edgeEnter={
+        if ($window.Visible -and $localChrome.Pill.EdgeTab -and !$localChrome.DockHover) {
+            [void]$window.BeginInvoke([Action]{ Update-LocalDockHover })
+        }
+    }
+    $localChrome.Pill.Add_MouseEnter($edgeEnter)
+    foreach ($index in 0..4) {
+        $tag=$localChrome.Pill.AddEdgeButton($index)
+        $tag.ContextMenuStrip=$menu
+        $tag.Add_MouseEnter($edgeEnter)
+        $tag.Add_Click({ Open-LocalSessionList $this.Tag })
+    }
+    $localChrome.AllSessions.Text='全部会话'
+    $localChrome.AllSessions.Name='edge-all-sessions'
+    $localChrome.AllSessions.Add_Click({ Set-SessionSelection 'Attention' $null })
+    $band.Controls.Add($localChrome.AllSessions)
+    $localChrome.ReminderFilters=@(foreach ($kind in '待输入','完成未读','进行中','已完成') {
+        $tab=[JieShou.HudButton]::new()
+        $tab.Name="edge-filter-$kind"; $tab.Tag=$kind; $tab.Visible=$false
+        $tab.Add_Click({ Set-SessionSelection 'Attention' $this.Tag })
+        $band.Controls.Add($tab)
+        $tab.BringToFront()
+        $tab
+    })
     $localChrome.Pill.Add_MoveRequested({
         $pos = $this.RequestedLocation
-        Move-ReminderHud $pos.X $pos.Y ([Windows.Forms.Screen]::FromPoint([Windows.Forms.Cursor]::Position).WorkingArea)
+        Move-ReminderHud $pos.X $pos.Y ([Windows.Forms.Screen]::FromPoint($this.DragPointer).WorkingArea)
     })
+    $localChrome.Pill.Add_DragFinished({ Complete-LocalHudDrag $this.DragPointer })
     $localChrome.Pill.AccessibleDescription = '点击展开，拖动移动，右键设置外观'
     $localChrome.Settings.Text = '外观'
     $localChrome.Settings.AccessibleName = '外观'
@@ -192,22 +268,43 @@ function Initialize-LocalHudView {
             $item = [Windows.Forms.ToolStripMenuItem]::new('外观设置…')
             $item.Add_Click({ [void]$window.BeginInvoke([Action]{ Show-HudAppearance }) })
             $popup.Items.Insert(0,$item)
-            $popup.Add_Opening({ [JieShou.HudCommandMenuRenderer]::Apply($this,$hudColors,$hudFonts.Body,$localDpi) })
+            $toggleHide = [Windows.Forms.ToolStripMenuItem]::new('自动隐藏')
+            $toggleHide.Name = 'toggle-autohide'
+            $toggleHide.Add_Click({
+                $next = $appearance.Copy()
+                $next.AutoHide = !$appearance.AutoHide
+                try { $next.Save($appearancePath) }
+                catch { Write-Warning "未能保存自动隐藏设置：$($_.Exception.Message)"; return }
+                $script:appearance = $next
+                $this.Checked = $next.AutoHide
+                if ($localChrome.AppearanceDialog) { $localChrome.AppearanceDialog.SetAutoHide($next.AutoHide) }
+                $localChrome.DockHover = $false
+                $localChrome.HoverUntil = 0
+                Update-ReminderWindow
+            })
+            $popup.Items.Insert(1,$toggleHide)
+            $popup.Add_Opening({
+                $this.Items['toggle-autohide'].Checked = $appearance.AutoHide
+                [JieShou.HudCommandMenuRenderer]::Apply($this,$hudColors,$hudFonts.Body,$localDpi)
+            })
         }
     }
     $dragGrip.Text = ''
     $dragGrip.BackColor = [Drawing.Color]::Transparent
     $dragGrip.AccessibleRole = 'Grip'
-    $dragGrip.AccessibleDescription = '按住消息握把移动浮窗'
+    $dragGrip.AccessibleDescription = '按住拖动浮窗'
     $dragGrip.Add_MouseEnter({ $dragGrip.Invalidate() })
     $dragGrip.Add_MouseLeave({ $dragGrip.Invalidate() })
     $dragGrip.Add_MouseCaptureChanged({ $dragGrip.Invalidate() })
     $hudTips.SetToolTip($dragGrip,'按住拖动浮窗')
-    $header.Name = 'hud-toggle'
+    $header.Name = 'hud-title'
     $header.TextAlign = 'MiddleLeft'
-    $header.Cursor = [Windows.Forms.Cursors]::Hand
+    $header.Cursor = [Windows.Forms.Cursors]::SizeAll
+    $header.AccessibleDescription='按住标题拖动浮窗'
+    Register-ReminderDrag $header
+    Register-ReminderDrag $band
     $localChrome.Toggle.Name = 'hud-toggle-action'
-    $localChrome.Toggle.Add_Click({ $header.PerformClick() })
+    $localChrome.Toggle.Add_Click({ Switch-ReminderExpansion })
     $localChrome.Prev.Name = 'local-prev'
     $localChrome.Prev.Text = '上一页'
     $localChrome.Prev.Add_Click({ $localView.Page--; $list.AutoScrollPosition=[Drawing.Point]::Empty; Update-ReminderWindow })
@@ -231,15 +328,21 @@ function Initialize-LocalHudView {
     $list.BackColor = [Drawing.Color]::White
     $list.TabIndex = 3
     $menuButton.Visible = $false
-    $window.Add_DpiChanged({
-        param($sender, $change)
-        if ($window.IsHandleCreated -and !$window.IsDisposed) {
-            $localChrome.ExpansionTop=$null
-            $suggested = $change.SuggestedRectangle
-            Set-ReminderHudPlacement $placement $suggested ([Windows.Forms.Screen]::FromRectangle($suggested).WorkingArea)
-            [void]$window.BeginInvoke([Action]{ if (!$window.IsDisposed) { Update-ReminderWindow } })
-        }
-    })
+    $refreshDisplay = {
+        if (!$window.IsHandleCreated -or $window.IsDisposed -or $localChrome.DisplayRefreshPending) { return }
+        $localChrome.DisplayRefreshPending = $true
+        [void]$window.BeginInvoke([Action]{
+            $localChrome.DisplayRefreshPending = $false
+            if (!$window.IsDisposed) {
+                [JieShou.HudDisplayIds]::Refresh()
+                if ($localChrome.AppearanceDialog) { $localChrome.AppearanceDialog.RefreshScreens() }
+                $localChrome.ExpansionSource = $null
+                Update-ReminderWindow
+            }
+        })
+    }
+    $window.Add_DpiChanged($refreshDisplay)
+    $window.Add_WorkAreaChanged($refreshDisplay)
     [void]$window.Handle
     Set-HudAppearance
 }
@@ -274,7 +377,7 @@ function Sync-LocalSessionRows($PageRows,$AttentionLabels) {
         } else { '时间未知' }
         $stateLabel = $turnLabels[$session.turn]
         if ($AttentionLabels.ContainsKey("$($session.agent)/$($session.id)")) { $stateLabel = $AttentionLabels["$($session.agent)/$($session.id)"] }
-        if ($entry.ContextOnly) { $stateLabel='筛选时段外' }
+        if ($entry.ContextOnly) { $stateLabel=if ($localView.Attention) { '侧聊所属主会话' } else { '筛选时段外' } }
         $indicator=switch ($stateLabel) { '进行中' { 'Running' } '完成未读' { 'CompletedUnread' } '待输入' { 'Attention' } default { 'None' } }
         $role=if ($side) { 'Codex 侧聊' } elseif ($hasChildren) { 'Codex 主会话' } else { $session.agent }
         $detail="$role   ·   $stateLabel"
@@ -285,10 +388,10 @@ function Sync-LocalSessionRows($PageRows,$AttentionLabels) {
         elseif ($side) { $detail+=' · 主会话不可用'; $description+='。主会话不可用。' }
         elseif ($canOpen) { $description+='。打开此会话。' }
         $titleFont=if ($side) { $hudFonts.Body } else { $hudFonts.Name }
-        $row.Bind($title,$session.agent,$detail,$time,$description,$indicator,$canOpen,$agentIcons[$iconKey],$hudColors,$titleFont,$hudFonts.Small,$localDpi,$side,$hasChildren)
+        $row.Bind($title,$session.agent,$detail,$time,$description,$indicator,$canOpen,$agentIcons[$iconKey],$hudColors,$titleFont,$hudFonts.Small,$localDpi,$side,$hasChildren,$entry.Branch)
         $wanted.Add($row)
         if ($entry.Priority) { $unread++ }
-        if ($hasChildren) {
+        if ($hasChildren -and !$localView.Attention) {
             $toolKey="sidechats/$($session.id)"
             $toggle=$null
             if (!$localChrome.Rows.TryGetValue($toolKey,[ref]$toggle)) {
@@ -329,6 +432,8 @@ function Sync-LocalSessionRows($PageRows,$AttentionLabels) {
             elseif ($localView.Sources[$localView.Agent] -eq 'missing') { "未找到 $($localView.Agent) 的本地索引。" }
             elseif ($localView.Sources[$localView.Agent] -eq 'unavailable') { "$($localView.Agent) 的索引暂不可读。" }
             elseif ($localView.Sources[$localView.Agent] -eq 'partial') { '部分会话记录暂不可读，当前没有匹配会话。' }
+            elseif ($localView.Attention -and $localChrome.PopulatedFilter) { '已处理完' }
+            elseif ($localView.Attention) { "当前筛选范围内没有$($localView.Attention)的会话。" }
             elseif ($localView.Days) { '此时间范围内没有会话，可切换到「全部时间」。' }
             else { '当前来源暂无会话。' }
         $wanted.Add($hint)
@@ -351,7 +456,8 @@ function Get-LocalAttention($Rows,$Waiting,[datetimeoffset]$Now) {
     $inputCount = [JieShou.PillTally]::new()
     $unreadCount = [JieShou.PillTally]::new()
     $running = [JieShou.PillTally]::new()
-    $completed = 0
+    $reminders=@{}
+    foreach ($kind in '待输入','完成未读','进行中','已完成') { $reminders[$kind]=[Collections.Generic.List[object]]::new() }
     $requests = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($request in $Waiting) { [void]$requests.Add($request.Event.TaskId) }
     $labels = [Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
@@ -366,11 +472,18 @@ function Get-LocalAttention($Rows,$Waiting,[datetimeoffset]$Now) {
     }
     $nowMs = $Now.ToUnixTimeMilliseconds()
     foreach ($row in $Rows) {
-        $waitingForUser = $row.needsInput -eq 1 -or ($row.agent -ceq 'Codex' -and $requests.Contains($row.id)) -or
-            ($row.agent -ceq 'Qoder' -and $row.desktop -and $localView.QoderWaiting -ccontains $row.id)
+        $waitingForUser = $row.needsInput -eq 1 -or ($row.agent -ceq 'Codex' -and $requests.Contains($row.id))
         $key = "$($row.agent)/$($row.id)"
         $turn = $row.turn
         $unread = $row.unread -eq 1
+        if ($row.agent -ceq 'Qoder' -and $row.desktop -and $localView.QoderSnapshot) {
+            $live = $localView.QoderSnapshot
+            $badge = $live.Badges[$row.id]
+            if ($badge -ceq 'waiting') { $waitingForUser = $true }
+            elseif ($badge -ceq 'running' -or ($turn -ceq 'unknown' -and $live.StartedAt -gt 0 -and $row.bufferedSince -ge $live.StartedAt)) {
+                $turn = 'inProgress'; $labels[$key] = '进行中'
+            }
+        }
         if ($row.agent -ceq 'DSH' -and $dshTitles.Contains($row.desktopTitle) -and !$duplicates.Contains($row.desktopTitle)) {
             switch ($localView.DshBadges[$row.desktopTitle]) {
                 'waiting' { $waitingForUser = $true }
@@ -380,18 +493,24 @@ function Get-LocalAttention($Rows,$Waiting,[datetimeoffset]$Now) {
         }
         if ($waitingForUser) {
             $inputCount.Add($row.agent)
+            $reminders['待输入'].Add($row)
             $labels[$key] = '待输入'
             continue
         }
         switch ($turn) {
-            'inProgress' { $running.Add($row.agent) }
+            'inProgress' {
+                $running.Add($row.agent)
+                $reminders['进行中'].Add($row)
+                $labels[$key]='进行中'
+            }
             'completed' {
-                $completed++
+                $reminders['已完成'].Add($row)
                 if (!$unread) { break }
                 $labels[$key] = '完成未读'
                 if ($row.finished -gt 0 -and
                     $row.finished -le $nowMs -and $row.finished -gt $nowMs-86400000L) {
                     $unreadCount.Add($row.agent)
+                    $reminders['完成未读'].Add($row)
                     $expires = [datetimeoffset]::FromUnixTimeMilliseconds($row.finished+86400000L).UtcDateTime
                     if ($expires -lt $localView.NextExpiry) { $localView.NextExpiry = $expires }
                 }
@@ -404,15 +523,44 @@ function Get-LocalAttention($Rows,$Waiting,[datetimeoffset]$Now) {
         $(if ($unreadCount.Total) { [string]$unreadCount.Total } else { '' })
         [string]$running.Total
         [string]$Rows.Count
-        [string]$completed
+        [string]$reminders['已完成'].Count
     )
-    return @{ Values=$values; Labels=$labels; Breakdown=[JieShou.PillTally[]]@($inputCount,$unreadCount,$running) }
+    return @{ Values=$values; Labels=$labels; Reminders=$reminders; Breakdown=[JieShou.PillTally[]]@($inputCount,$unreadCount,$running) }
+}
+
+function Test-LocalEdgeTab {
+    $appearance.AutoHide -and $localChrome.DockReady -and !$expanded -and !$localChrome.AppearanceDialog -and
+        (!$drag.Active -or ($localChrome.Pill.EdgeTab -and $localChrome.Pill.EdgePeek))
+}
+
+function Update-LocalDockHover([Drawing.Point]$Pointer=[Windows.Forms.Cursor]::Position,[long]$Now=[Environment]::TickCount64) {
+    if (!$appearance.AutoHide -or !$window.Visible -or $expanded -or $localChrome.Surface.IsRevealing -or $localChrome.AppearanceDialog) { return }
+    # Keep the full capsule available while the pointer crosses between its
+    # child controls. Use the existing UI timer, including when the feed is idle.
+    $inside=$window.Bounds.Contains($Pointer)
+    if ($inside -or $drag.Active -or $localChrome.Pill.Capture -or $menu.Visible -or $localChrome.Pill.EdgeKeyboardFocus) { $localChrome.HoverUntil=$now+650 }
+    $peek=$now -lt [long]$localChrome.HoverUntil
+    if ($localChrome.DockHover -eq $peek -and $localChrome.Pill.EdgeTab -eq (Test-LocalEdgeTab)) { return }
+    $localChrome.DockHover=$peek
+    if ($placement.Docked -and $localChrome.Surface.IsActive -and $localChrome.Pill.EdgeTab -and (Test-LocalEdgeTab)) {
+        $work=(Get-ReminderHudScreen $placement).WorkingArea
+        $localChrome.Surface.PeekEdge($peek,$work,$placement.Anchor)
+        return
+    }
+    Update-ReminderWindow
 }
 
 function Start-LocalRollUp {
-    $work = [Windows.Forms.Screen]::FromRectangle($window.Bounds).WorkingArea
-    $size = $localChrome.Pill.MeasureForWidth($work.Width)
-    $bounds = Get-ReminderHudBounds $placement $work $size.Width $size.Height
+    $localView.Attention=$null
+    $work = (Get-ReminderHudScreen $placement).WorkingArea
+    if ($appearance.AutoHide) {
+        $localChrome.DockHover=$false
+        $localChrome.HoverUntil=0
+        $localChrome.Pill.EdgePeek=$false
+        $localChrome.Pill.EdgeTab=Test-LocalEdgeTab
+    }
+    $size = $localChrome.Pill.MeasureForArea($work.Size)
+    $bounds = Get-ReminderHudBounds $placement $work $size.Width $size.Height $localSystemDpi
     return $localChrome.Surface.RollUp($bounds)
 }
 
@@ -421,9 +569,15 @@ function Update-LocalHudWindow {
     $window.SuspendLayout()
     $list.SuspendLayout()
     try {
-        Set-LocalHudTypeScale ([int][JieShou.LocalWindowDpi]::GetDpiForWindow($window.Handle))
-        $work = if ($placement.Positioned) { [Windows.Forms.Screen]::FromRectangle($window.Bounds).WorkingArea }
-            else { [Windows.Forms.Screen]::PrimaryScreen.WorkingArea }
+        $screen = Get-ReminderHudScreen $placement
+        $work = $screen.WorkingArea
+        $script:localSystemDpi=[JieShou.HudDisplayScale]::SystemDpi($screen)
+        $oldDpi=$localDpi
+        $oldScroll=-$list.AutoScrollPosition.Y
+        Set-LocalHudTypeScale ([JieShou.HudDisplayScale]::For($screen,$appearance))
+        if ($expanded -and $oldScroll -gt 0 -and $oldDpi -gt 0 -and $oldDpi -ne $localDpi) {
+            $oldScroll=[int][Math]::Round($oldScroll*$localDpi/$oldDpi)
+        }
         $pad = Get-HudPixels 18
         $bandHeight = Get-HudPixels ($appearance.Size+32)
         $toggleWidth = Get-HudPixels 36
@@ -445,6 +599,7 @@ function Update-LocalHudWindow {
             $pending = @(Get-ReminderWaiting $state -Pending | Where-Object { $ids.Contains($_.Event.TaskId) })
         }
         $pill = $localChrome.Pill
+        $pill.Vertical=$placement.Vertical
         $opening = $expanded -and $pill.Visible
         if ($expanded) { $localChrome.Surface.UseControls($appearance.Opacity / 100.0) }
         else { $localChrome.Surface.CancelReveal() }
@@ -453,13 +608,14 @@ function Update-LocalHudWindow {
         $sourceStatus=$localView.Sources[$localView.Agent]
         $countsReady=$localView.Status -eq 'Ready' -and $sourceStatus -notin 'missing','unavailable'
         $pill.Values = if ($countsReady) { ,$attention.Values } else { ,[string[]]@() }
+        $localChrome.DockReady=$countsReady
+        $pill.EdgeTab=Test-LocalEdgeTab
+        $pill.EdgePeek=$pill.EdgeTab -and $localChrome.DockHover
         $compactText = if ($countsReady) { $pill.Caption() }
             elseif ($sourceStatus -eq 'unavailable') { "$($localView.Agent) 暂不可读" }
             elseif ($sourceStatus -eq 'missing') { "未找到 $($localView.Agent) 索引" }
             elseif ($localView.Status -eq 'Loading') { '正在读取会话…' } else { '会话索引暂不可用' }
         $period = switch ($localView.Days) { 1 { '近 24 小时' } 7 { '近 7 天' } default { '全部时间' } }
-        $scopeText = "$($localView.Agent) · $period"
-        if ($tray) { $tray.Text = "AMC · $scopeText · $compactText" }
         $gripHost = if ($expanded) { $localChrome.Band } else { $pill }
         if ($dragGrip.Parent -ne $gripHost) {
             $gripHost.Controls.Add($dragGrip)
@@ -469,23 +625,34 @@ function Update-LocalHudWindow {
         $localChrome.Band.Visible = $expanded
         $pill.Text = $compactText
         $pill.AccessibleName = if ($countsReady) { $pill.Caption($true) } else { $compactText }
-        $pill.AccessibleDescription = "智能体消息中心 · $scopeText。待输入含审批，完成未读限最近 24 小时。拖动左侧消息握把移动浮窗，点击数字展开。"
+        if ($pill.EdgeTab -and !$pill.EdgePeek) { $pill.AccessibleName=$pill.NoticeCaption }
+        $pill.AccessibleDescription = "智能体消息中心 · $($localView.Agent) · $period。待输入含审批，完成未读限最近 24 小时。拖动握把移动浮窗，点击数字查看对应会话。"
         $pill.LayoutDpi = $localDpi
+        if ($placement.Docked -and $placement.Positioned) {
+            # Migrate a saved free-form position once, using the normal capsule
+            # dimensions so changing to the thin idle rail cannot move its slot.
+            $edge=$pill.EdgeTab; $pill.EdgeTab=$false
+            $normal=$pill.MeasureForArea($work.Size); $pill.EdgeTab=$edge
+            $old=[JieShou.HudGeometry]::Place($work,$normal,$localSystemDpi,$placement.Anchor,$true,$placement.Right,$placement.Bottom,$placement.X,$placement.Y)
+            $placement.Anchor=[JieShou.HudGeometry]::NearestDock($old,$work,$placement.Vertical)
+            $placement.Positioned=$false
+        }
         if ($expanded) {
             $header.Font = $hudFonts.Title
             $header.Text = $title
-            $width = Get-HudPixels 448
+            $width = Get-HudPixels ([Math]::Max(448,448*$appearance.Size/15.0))
         } else {
-            $desired = $pill.MeasureForWidth($work.Width)
+            $desired = $pill.MeasureForArea($work.Size)
             $bandHeight = $desired.Height
             $width = $desired.Width
         }
         $width = [Math]::Min($work.Width, $width)
         $localChrome.Toggle.Text = if ($expanded) { '收起  ▴' } else { '展开  ▾' }
-        $header.AccessibleDescription = $localChrome.Toggle.Text
         if ($localChrome.Band.Width -ne $width) { $localChrome.Band.Width=$width }
         $gripWidth = $pill.GripWidth
-        $dragGrip.SetBounds(0,0,$gripWidth,$bandHeight)
+        $dragGrip.Visible=$expanded -or !$pill.EdgeTab -or $pill.EdgePeek
+        if ($expanded) { $dragGrip.SetBounds(0,0,$gripWidth,$bandHeight) }
+        else { $dragGrip.Bounds = $pill.GripBounds($desired) }
         $dragGrip.Invalidate()
         $settingsW = $toggleWidth
         $rightMargin = Get-HudPixels 10
@@ -494,9 +661,19 @@ function Update-LocalHudWindow {
             $localChrome.Settings.SetBounds(($width-$rightMargin-$settingsW-$toggleWidth),0,$settingsW,$bandHeight)
         }
         $localChrome.Toggle.SetBounds(($width-$rightMargin-$toggleWidth),0,$toggleWidth,$bandHeight)
-        foreach ($c in $localChrome.Range,$localChrome.Sort,$localChrome.Section,$list) { $c.Visible = $expanded }
-        $groups=@(if ($expanded) { Get-SessionGroups $visibleRows $attention.Labels })
-        $pages = [Math]::Max(1,[int][Math]::Ceiling($groups.Count/12.0))
+        foreach ($c in $localChrome.Range,$localChrome.Sort,$localChrome.Section,$localScrollBar) { $c.Visible = $expanded }
+        $sessionRows=$visibleRows
+        if ($expanded -and $localView.Attention) {
+            $sessionRows=$attention.Reminders[$localView.Attention]
+            $waiting=$pending=@()
+            $filter="$($localView.Agent)|$($localView.Days)|$($localView.Attention)"
+            if ($countsReady -and $sessionRows.Count) { $localChrome.PopulatedFilter=$filter }
+            elseif (!$countsReady -or $localChrome.PopulatedFilter -cne $filter) { $localChrome.PopulatedFilter=$null }
+        } else {
+            $localChrome.PopulatedFilter=$null
+        }
+        $groups=@(if ($expanded) { Get-SessionGroups $sessionRows $attention.Labels })
+        $pages = if ($localView.Attention -ceq '进行中') { 1 } else { [Math]::Max(1,[int][Math]::Ceiling($groups.Count/12.0)) }
         $localView.Page = [Math]::Clamp([int]$localView.Page,0,$pages-1)
         $pager = $expanded -and $pages -gt 1
         $localChrome.Prev.Visible = $localChrome.Next.Visible = $localChrome.PageLabel.Visible = $pager
@@ -509,13 +686,13 @@ function Update-LocalHudWindow {
                 $localChrome.HeaderBottom=Set-SessionFilterLayout $pad $bandHeight $inside
                 $localChrome.FilterLayout=$filterKey
             }
-            $headerBottom=$localChrome.HeaderBottom
+            $headerBottom=Set-SessionStatusLayout $pad $localChrome.HeaderBottom $inside $attention $countsReady
             $localChrome.Band.Height = $headerBottom
             $toolbarTop = $headerBottom + (Get-HudPixels 5)
             $toolbarHeight = Get-HudPixels ($appearance.Size+19)
             $sortW = [Math]::Min([int]($inside*0.32),(Get-HudPixels (58+3.4*$appearance.Size)))
             $rangeW = [Math]::Min([int]($inside*0.34),(Get-HudPixels (60+3.6*$appearance.Size)))
-            $localChrome.Section.Text = if ($countsReady) { "$($visibleRows.Count) 个会话" }
+            $localChrome.Section.Text = if ($countsReady) { "$($sessionRows.Count) 个会话" }
                 elseif ($localView.Status -eq 'Loading') { '读取中' } else { '会话数未知' }
             $localChrome.Section.SetBounds($pad,$toolbarTop,($inside-$sortW-$rangeW),$toolbarHeight)
             $localChrome.Range.SetBounds(($width-$pad-$sortW-$rangeW),$toolbarTop,$rangeW,$toolbarHeight)
@@ -546,10 +723,9 @@ function Update-LocalHudWindow {
             }
             $localChrome.Prev.Enabled = $localView.Page -gt 0
             $localChrome.Next.Enabled = $localView.Page -lt $pages-1
-            $oldScroll = -$list.AutoScrollPosition.Y
             $pageRows=@(Get-SessionPage $groups)
             $order=($pageRows | ForEach-Object { "$($_.Session.agent)/$($_.Session.id)/$($_.Group.Children.Count -gt 0)" }) -join [char]0
-            $scope="$($localView.Agent)|$($localView.Days)|$($localView.Page)|$localDpi"
+            $scope="$($localView.Agent)|$($localView.Days)|$($localView.Attention)|$($localView.Page)|$localDpi"
             $cardsKey=if ($waiting.Count -or $pending.Count) {
                 "$localDpi|" + (ConvertTo-Json -Compress -Depth 12 -InputObject @($waiting,$pending,$codexFeed.Status))
             } else { '' }
@@ -571,7 +747,7 @@ function Update-LocalHudWindow {
             $rowWidth=$inside
             $contentHeight=0
             foreach ($c in $list.Controls) {
-                if ($c -is [JieShou.LocalRow]) { $contentHeight+=$c.ContentHeight($inside) }
+                if ($c -is [JieShou.LocalRow] -or $c -is [JieShou.SideChatToggle]) { $contentHeight+=$c.ContentHeight($inside) }
                 elseif ($c -eq $localChrome.EmptyHint) {
                     $c.Height=[Math]::Max((Get-HudPixels 48),$c.GetPreferredSize([Drawing.Size]::new($inside,0)).Height)
                     $contentHeight+=$c.Height
@@ -579,28 +755,44 @@ function Update-LocalHudWindow {
                 $contentHeight+=$c.Margin.Vertical
             }
             if ($contentHeight -gt $listMax) { $rowWidth=[Math]::Max(1,$inside-$localScrollBar.GutterWidth-(Get-HudPixels 2)) }
+            $contentHeight=0
             foreach ($c in $list.Controls) {
-                if ($c -is [JieShou.LocalRow]) { $c.Size=[Drawing.Size]::new($rowWidth,$c.ContentHeight($rowWidth)) }
-                else { $c.Width=$rowWidth-$c.Margin.Horizontal }
+                if ($c -is [JieShou.LocalRow] -or $c -is [JieShou.SideChatToggle]) { $c.Size=[Drawing.Size]::new($rowWidth,$c.ContentHeight($rowWidth)) }
+                else {
+                    $c.Width=$rowWidth-$c.Margin.Horizontal
+                    if ($c -eq $localChrome.EmptyHint) {
+                        $c.Height=[Math]::Max((Get-HudPixels 48),$c.GetPreferredSize([Drawing.Size]::new($c.Width,0)).Height)
+                    }
+                }
+                $contentHeight+=$c.Height+$c.Margin.Vertical
             }
-            $list.SetBounds($pad,$listTop,$inside,[Math]::Min($listMax,$contentHeight))
-            $height = $list.Bottom + $bottomPadding
+            $localScrollBar.SetBounds($pad,$listTop,$inside,[Math]::Min($listMax,$contentHeight))
+            $height = $localScrollBar.Bottom + $bottomPadding
         }
-        $bounds = Get-ReminderHudBounds $placement $work $width $height
+        $bounds = Get-ReminderHudBounds $placement $work $width $height $localSystemDpi
         if ($expanded) {
-            if ($opening) { $localChrome.ExpansionTop=$window.Top }
-            if ($null -ne $localChrome.ExpansionTop) {
-                $bounds.Y=[Math]::Clamp([int]$localChrome.ExpansionTop,$work.Top,$work.Bottom-$bounds.Height)
+            if ($opening) { $localChrome.ExpansionSource=$window.Bounds }
+            if ($null -eq $localChrome.ExpansionSource -and $placement.Docked) {
+                $compactSize=$pill.MeasureForArea($work.Size)
+                $localChrome.ExpansionSource=Get-ReminderHudBounds $placement $work $compactSize.Width $compactSize.Height $localSystemDpi
             }
+            if ($null -ne $localChrome.ExpansionSource) {
+                $bounds=[JieShou.HudGeometry]::Expand($localChrome.ExpansionSource,$bounds.Size,$work,$pill.Vertical,$localDpi)
+            }
+            $origin=if ($null -ne $localChrome.ExpansionSource) { $localChrome.ExpansionSource } else { $bounds }
+            $forward=[JieShou.HudGeometry]::OpensForward($origin,$work,$pill.Vertical)
+            $localChrome.Toggle.Glyph = if ($pill.Vertical) { if ($forward) { 'Previous' } else { 'Next' } }
+                elseif ($forward) { 'Collapse' } else { 'Down' }
             $radius = if ($appearance.Shape -eq '直角') { 0 } else { Get-HudPixels 16 }
             $localChrome.Surface.SetPanelBounds($bounds,$radius)
         } else {
-            $localChrome.ExpansionTop=$null
+            $localChrome.ExpansionSource=$null
+            $pill.OpensForward=[JieShou.HudGeometry]::OpensForward($bounds,$work,$pill.Vertical)
             $window.Bounds = $bounds
             $localChrome.ListScope=$null
             $pill.Bounds = $window.ClientRectangle
+            $pill.ArrangeEdgeButtons()
         }
-        if (!$placement.Positioned) { Set-ReminderHudPlacement $placement $window.Bounds $work }
     } finally {
         $list.ResumeLayout($true)
         $window.ResumeLayout($true)
@@ -609,7 +801,7 @@ function Update-LocalHudWindow {
     if ($expanded) {
         if ($oldScroll -gt 0 -and $oldScroll -ne -$list.AutoScrollPosition.Y) { $list.AutoScrollPosition=[Drawing.Point]::new(0,$oldScroll) }
         if ($move) { $list.CommitOrder() }
-        $localScrollBar.Refresh()
+        $localScrollBar.UpdateRails()
         $localChrome.Surface.PlayReveal()
     }
     $localChrome.ActivityAnimation.Refresh()

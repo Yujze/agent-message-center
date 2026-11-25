@@ -38,6 +38,7 @@ namespace JieShou {
         private readonly Form host;
         private readonly Strip upper=new Strip(), lower=new Strip();
         private Size size;
+        private Point offset;
         private int radius;
         private int[] cut;
         private Color top, bottom;
@@ -47,22 +48,25 @@ namespace JieShou {
             this.host=host;
             host.LocationChanged+=Sync; host.VisibleChanged+=Sync; host.HandleDestroyed+=OwnerDestroyed;
         }
-        internal void Apply(Size next,int r,Color topColor,Color bottomColor,byte opacity) {
+        internal void Apply(Rectangle viewport,int r,Color topColor,Color bottomColor,byte opacity) {
+            var next=viewport.Size;
+            bool moved=offset!=viewport.Location;
+            offset=viewport.Location;
             r=Math.Min(r,Math.Min(next.Width,next.Height)/2);
             if (r<=0) {
-                if (next==host.ClientSize) {
+                if (viewport==host.ClientRectangle) {
                     if (host.Region!=null) host.Region=null;
-                } else if (host.Region==null || radius!=0 || size!=next) host.Region=new Region(new Rectangle(Point.Empty,next));
+                } else if (host.Region==null || radius!=0 || size!=next || moved) host.Region=new Region(viewport);
                 upper.Hide(); lower.Hide();
                 enabled=false; cut=null; size=next; radius=0;
                 return;
             }
             bool reuse=cut!=null && size.Width==next.Width && r==radius && top==topColor && bottom==bottomColor && alpha==opacity;
-            if (enabled && reuse && size==next) return;
+            if (enabled && reuse && size==next && !moved) return;
             if (!reuse && !RenderStrips(next.Width,r,topColor,bottomColor,opacity)) {
                 cut=null;
                 Hide();
-                using var fallback=MetricPill.Outline(new Rectangle(Point.Empty,next),r);
+                using var fallback=MetricPill.Outline(viewport,r);
                 host.Region=new Region(fallback);
                 return;
             }
@@ -75,7 +79,9 @@ namespace JieShou {
                 shape.AddRectangle(new Rectangle(inset,next.Height-y,next.Width-2*inset,y-first));
             }
             if (next.Height>2*r) shape.AddRectangle(new Rectangle(0,r,next.Width,next.Height-2*r));
-            host.Region=new Region(shape);
+            var region=new Region(shape);
+            region.Translate(offset.X,offset.Y);
+            host.Region=region;
             size=next; radius=r; top=topColor; bottom=bottomColor; alpha=opacity;
             enabled=true;
             Sync(this,EventArgs.Empty);
@@ -103,8 +109,8 @@ namespace JieShou {
         private void Sync(object sender,EventArgs e) {
             if (!enabled) return;
             if (!host.Visible) { upper.Hide(); lower.Hide(); return; }
-            upper.Place(host.Left,host.Top);
-            lower.Place(host.Left,host.Top+size.Height-radius);
+            upper.Place(host.Left+offset.X,host.Top+offset.Y);
+            lower.Place(host.Left+offset.X,host.Top+offset.Y+size.Height-radius);
         }
         internal void Hide() { enabled=false; size=Size.Empty; upper.Hide(); lower.Hide(); }
         private void OwnerDestroyed(object sender,EventArgs e) {

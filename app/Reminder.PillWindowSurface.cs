@@ -12,6 +12,11 @@ namespace JieShou {
         private readonly Control grip;
         private readonly PanelCorners corners;
         private readonly PanelReveal reveal;
+        private readonly Timer edgeTimer=new Timer {Interval=16};
+        private readonly System.Diagnostics.Stopwatch edgeClock=new System.Diagnostics.Stopwatch();
+        private double edgeStart;
+        private Rectangle edgeWork;
+        private int edgeAnchor;
         private bool active, pending, disposed;
         public bool IsActive => active;
         public bool IsRevealing => reveal.Active;
@@ -25,6 +30,7 @@ namespace JieShou {
         public PillWindowSurface(Form host,MetricPill pill,Control grip,Control band) {
             this.host=host; corners=new PanelCorners(host); this.pill=pill; this.grip=grip;
             reveal=new PanelReveal(host,pill,band,corners);
+            edgeTimer.Tick+=(s,e)=>StepEdgePeek();
             grip.MouseEnter+=VisualChanged; grip.MouseLeave+=VisualChanged;
             grip.MouseCaptureChanged+=VisualChanged;
             pill.GotFocus+=VisualChanged; pill.LostFocus+=VisualChanged;
@@ -50,6 +56,7 @@ namespace JieShou {
 
         public void UseControls(double opacity) {
             if (active || reveal.Closing) reveal.Begin();
+            StopEdgePeek();
             if (active) {
                 active=false;
                 SetLayered(false);
@@ -62,7 +69,40 @@ namespace JieShou {
         public void PlayReveal() => reveal.Play();
         public bool RollUp(Rectangle bounds) => reveal.RollUp(bounds);
         public void FinishReveal() => reveal.Finish();
+        public void BeginDrag() {
+            reveal.Finish();
+            StopEdgePeek();
+        }
         public void CancelReveal() { if (reveal.Active) reveal.Cancel(); }
+
+        private void StopEdgePeek() {
+            edgeTimer.Stop();edgeClock.Reset();pill.EdgeFraction=null;
+        }
+        public void PeekEdge(bool show,Rectangle work,int anchor) {
+            pill.AccessibleName=show ? pill.Caption(true) : pill.NoticeCaption;
+            if(!pill.Vertical) {
+                StopEdgePeek();
+                pill.EdgePeek=show;
+                PlaceEdge(work,anchor);
+                return;
+            }
+            edgeStart=pill.EdgeFraction ?? (pill.EdgePeek ? 1 : 0);
+            pill.EdgePeek=show;edgeWork=work;edgeAnchor=anchor;
+            edgeClock.Restart();edgeTimer.Start();StepEdgePeek();
+        }
+        private void StepEdgePeek() {
+            if(!active || reveal.Active || !host.Visible || !pill.Visible || !pill.EdgeTab) { StopEdgePeek();return; }
+            double t=SessionActivityAnimation.MotionAllowed ? Math.Min(1,edgeClock.Elapsed.TotalMilliseconds/155) : 1;
+            double target=pill.EdgePeek ? 1 : 0;
+            pill.EdgeFraction=target+(edgeStart-target)*Math.Pow(1-t,3);
+            if(t>=1) StopEdgePeek();
+            PlaceEdge(edgeWork,edgeAnchor);
+        }
+        private void PlaceEdge(Rectangle work,int anchor) {
+            host.Bounds=HudGeometry.Dock(work,pill.MeasureForArea(work.Size),anchor,pill.Vertical);
+            pill.Bounds=host.ClientRectangle;
+            pill.ArrangeEdgeButtons();Present();
+        }
 
         public void Present() {
             if (disposed || pill.Width<2 || pill.Height<2) return;
@@ -82,7 +122,8 @@ namespace JieShou {
             if (!active) {
                 // Preserve the controls when the desktop cannot accept a layered surface.
                 SetLayered(false);
-                MetricPill.ShapeWindow(host,pill.CornerRadius);
+                if(pill.EdgeTab) host.Region=pill.EdgeRegion();
+                else MetricPill.ShapeWindow(host,pill.CornerRadius);
                 host.Opacity=pill.Appearance.Opacity/100.0;
             }
         }
@@ -109,6 +150,7 @@ namespace JieShou {
 
         public void Dispose() {
             disposed=true;
+            edgeTimer.Dispose();
             reveal.Dispose();
             corners.Dispose();
             grip.MouseEnter-=VisualChanged; grip.MouseLeave-=VisualChanged; grip.MouseCaptureChanged-=VisualChanged;

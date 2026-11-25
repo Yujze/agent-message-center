@@ -10,19 +10,26 @@ function Update-QoderAttention {
     if ($UiTest) { return }
     $now = [datetime]::UtcNow
     $scan = $localView.QoderScan
-    $ids = $localView.QoderWaiting
+    $snapshot = $localView.QoderSnapshot
     if ($scan -and $scan.IsCompleted) {
         try {
-            $ids = $scan.GetAwaiter().GetResult()
-            if ($now -gt $localView.QoderScanStarted.AddSeconds(8)) { $ids = @() }
-        } catch { $ids = @() }
+            $snapshot = $scan.GetAwaiter().GetResult()
+            if ($now -gt $localView.QoderScanStarted.AddSeconds(8)) { $snapshot = $null }
+        } catch { $snapshot = $null }
         $localView.QoderScan = $null
     } elseif ($scan -and $now -gt $localView.QoderScanStarted.AddSeconds(8)) {
-        $ids = @()
+        $snapshot = $null
     }
-    if (($ids -join ',') -cne ($localView.QoderWaiting -join ',')) {
-        $localView.QoderWaiting = $ids
-        Update-ReminderWindow
+    $previous = $localView.QoderSnapshot
+    if ($snapshot -ne $previous) {
+        $changed = $snapshot.StartedAt -ne $previous.StartedAt -or $snapshot.Badges.Count -ne $previous.Badges.Count
+        if (!$changed) {
+            foreach ($id in $snapshot.Badges.Keys) {
+                if ($snapshot.Badges[$id] -cne $previous.Badges[$id]) { $changed = $true; break }
+            }
+        }
+        $localView.QoderSnapshot = $snapshot
+        if ($changed) { Update-ReminderWindow }
     }
     if (!$localView.QoderScan -and (!$localView.QoderScanStarted -or $now -ge $localView.QoderScanStarted.AddSeconds(4))) {
         $localView.QoderScanStarted = $now

@@ -56,7 +56,7 @@ namespace JieShou {
             if (Active || !host.Visible || !pill.Visible || !SessionActivityAnimation.MotionAllowed) return;
             if (!CapturePill(host.Bounds)) return;
             phase = 0;
-            if (!PaintPill(host.Top)) { Cancel(); return; }
+            if (!PaintPill()) { Cancel(); return; }
             displayedBounds = pillBounds;
             displayedRadius = pillRadius;
             ChangeDirection(false);
@@ -110,10 +110,11 @@ namespace JieShou {
         }
         private static int Blend(int a, int b, double t) => a + (int)Math.Round((b - a) * t);
         // Normalize just the remaining stretch of the curve after a reversal or resize.
-        private double Amount(double span) {
+        private double Amount(bool primary) {
             double end = Closing ? 0 : 1;
-            double from = Ease(segmentPhase / span), range = end - from;
-            if (Math.Abs(range) > 1e-8) return (Ease(phase / span) - from) / range;
+            double Progress(double t) => Ease(primary ? t : (t-.10)/.85);
+            double from = Progress(segmentPhase), range = end - from;
+            if (Math.Abs(range) > 1e-8) return (Progress(phase) - from) / range;
             return segmentPhase == end ? 1 : (phase - segmentPhase) / (end - segmentPhase);
         }
 
@@ -124,28 +125,31 @@ namespace JieShou {
                 Finish(); return;
             }
             var end = Closing ? pillBounds : panelBounds;
-            double y = Amount(1), x = Amount(.8);
-            var rect = new Rectangle(Blend(segmentBounds.X,end.X,x), Blend(segmentBounds.Y,end.Y,y),
-                Blend(segmentBounds.Width,end.Width,x), Blend(segmentBounds.Height,end.Height,y));
-            Apply(rect, Blend(segmentRadius, Closing ? pillRadius : panelRadius, y));
-            if (!PaintPill(rect.Y)) Finish();
+            double x = Amount(pill.Vertical), y = Amount(!pill.Vertical);
+            var rect = Rectangle.FromLTRB(Blend(segmentBounds.Left,end.Left,x), Blend(segmentBounds.Top,end.Top,y),
+                Blend(segmentBounds.Right,end.Right,x), Blend(segmentBounds.Bottom,end.Bottom,y));
+            Apply(rect, Blend(segmentRadius, Closing ? pillRadius : panelRadius, pill.Vertical ? x : y));
+            if (!PaintPill()) Finish();
         }
 
-        private bool PaintPill(int y) {
+        private bool PaintPill() {
             byte alpha = (byte)Math.Round(opacity * (1 - Ease(phase * 2)));
             if (alpha == 0) { HideOverlay(); return true; }
             if (PillWindowSurface.Upload(Handle, compact, alpha) != 0) return false;
-            overlayVisible = SetWindowPos(Handle, IntPtr.Zero, pillBounds.X, y, 0, 0, overlayVisible ? 0x15u : 0x55u);
+            overlayVisible = SetWindowPos(Handle, IntPtr.Zero, pillBounds.Left, pillBounds.Top, 0, 0, overlayVisible ? 0x15u : 0x55u);
             return overlayVisible;
         }
 
         private void Apply(Rectangle bounds, int r) {
-            var layout = new Rectangle(bounds.Location, panelBounds.Size);
-            if (host.Bounds != layout) host.Bounds = layout;
-            if (band.Width != layout.Width) band.Width = layout.Width;
-            var viewport = new Size(Math.Min(bounds.Width, layout.Width), Math.Min(bounds.Height, layout.Height));
+            // Keep text laid out at the final desktop coordinates. Only expose the
+            // part reached by the moving edge, including right- and bottom-origin reveals.
+            if (host.Bounds != panelBounds) host.Bounds = panelBounds;
+            if (band.Width != panelBounds.Width) band.Width = panelBounds.Width;
+            var viewport = Rectangle.Intersect(bounds,panelBounds);
+            viewport.Offset(-panelBounds.Left,-panelBounds.Top);
             var colors = pill.Colors;
-            corners.Apply(viewport, r, colors.Chrome, viewport.Height <= band.Height ? colors.Chrome : colors.Surface,
+            corners.Apply(viewport, r, viewport.Top < band.Height ? colors.Chrome : colors.Surface,
+                viewport.Bottom <= band.Height ? colors.Chrome : colors.Surface,
                 (byte)Math.Round(255 * host.Opacity));
             // Paint exposed child regions in this frame. No RDW_INVALIDATE: rows already on screen stay intact.
             if (Active && displayedBounds != bounds)
@@ -164,7 +168,7 @@ namespace JieShou {
                 if (!end.IsEmpty && host.IsHandleCreated && !host.Disposing) {
                     Apply(end, collapsed ? pillRadius : panelRadius);
                     if (collapsed) {
-                        if (host.Visible) PaintPill(host.Top);
+                        if (host.Visible) PaintPill();
                         // Let the normal compact layout take over under the final overlay.
                         Active = Closing = false;
                         Collapsed?.Invoke(this, EventArgs.Empty);

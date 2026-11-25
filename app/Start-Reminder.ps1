@@ -27,8 +27,6 @@ if ($CodexLocal) {
     Add-Type -Namespace JieShou -Name LocalWindowDpi -MemberDefinition @'
         [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
         public static extern System.IntPtr SetThreadDpiAwarenessContext(System.IntPtr context);
-        [System.Runtime.InteropServices.DllImport("user32.dll")]
-        public static extern uint GetDpiForWindow(System.IntPtr window);
 '@
     [void][JieShou.LocalWindowDpi]::SetThreadDpiAwarenessContext([IntPtr](-4))
 }
@@ -50,6 +48,7 @@ $accent = [Drawing.Color]::FromArgb(19, 100, 98)
 $surface = [Drawing.Color]::FromArgb(243, 247, 248)
 
 $window = New-ReminderHudForm
+$window.OwnsDpiLayout=[bool]$CodexLocal
 $window.Text = '智能体消息中心（模拟）'
 $window.FormBorderStyle = 'None'
 $window.StartPosition = 'Manual'
@@ -60,26 +59,50 @@ $window.ForeColor = $ink
 $window.Font = [Drawing.Font]::new('Microsoft YaHei UI', 9)
 $window.AccessibleName = '智能体消息中心 模拟浮窗'
 
-$header = [Windows.Forms.Button]::new()
-$header.FlatStyle = 'Flat'
-$header.FlatAppearance.BorderSize = 0
-$header.BackColor = $accent
-$header.ForeColor = [Drawing.Color]::White
-$header.SetBounds(0, 0, 210, 46)
-$header.Add_Click({
+function Switch-ReminderExpansion {
     $script:expanded = !$expanded
     if ($CodexLocal -and !$expanded -and (Start-LocalRollUp)) { return }
     Update-ReminderWindow
-})
+}
+if ($CodexLocal) {
+    $header = [Windows.Forms.Label]::new()
+} else {
+    $header = [Windows.Forms.Button]::new()
+    $header.FlatStyle = 'Flat'
+    $header.FlatAppearance.BorderSize = 0
+    $header.Add_Click({ Switch-ReminderExpansion })
+}
+$header.BackColor = $accent
+$header.ForeColor = [Drawing.Color]::White
+$header.SetBounds(0, 0, 210, 46)
 $window.Controls.Add($header)
 
 function Move-ReminderHud([int]$X, [int]$Y, [Drawing.Rectangle]$WorkArea) {
-    if ($CodexLocal -and $localChrome.Surface) { $localChrome.Surface.FinishReveal(); $localChrome.ExpansionTop=$null }
+    if ($CodexLocal -and $localChrome.Surface) {
+        $localChrome.Surface.BeginDrag()
+        $localChrome.ExpansionSource=$null
+    }
     $moved = [Drawing.Rectangle]::new($X, $Y, $window.Width, $window.Height)
-    Set-ReminderHudPlacement $placement $moved $WorkArea
-    $bounds = Get-ReminderHudBounds $placement $WorkArea $window.Width $window.Height
+    $dpi = if ($CodexLocal) { [JieShou.HudDisplayIds]::DpiAt($WorkArea.Left,$WorkArea.Top) } else { 96 }
+    if ($CodexLocal) {
+        $target=[Windows.Forms.Screen]::FromRectangle($WorkArea)
+        $displayId=[JieShou.HudDisplayIds]::For($target.DeviceName)
+        $changedDisplay=$placement.Display -ne $displayId
+        $placement.Display=$displayId
+    }
+    Set-ReminderHudPlacement $placement $moved $WorkArea $dpi
+    $bounds = Get-ReminderHudBounds $placement $WorkArea $window.Width $window.Height $dpi
     $window.Bounds = $bounds
-    Set-ReminderHudPlacement $placement $bounds $WorkArea
+    Set-ReminderHudPlacement $placement $bounds $WorkArea $dpi
+    if ($CodexLocal -and $changedDisplay) {
+        Update-ReminderWindow
+        return
+    }
+    if ($CodexLocal -and !$expanded) {
+        $pill=$localChrome.Pill
+        $forward=[JieShou.HudGeometry]::OpensForward($bounds,$WorkArea,$pill.Vertical)
+        if ($pill.OpensForward -ne $forward) { $pill.OpensForward=$forward; $localChrome.Surface.Present() }
+    }
 }
 
 $dragGrip = [Windows.Forms.Label]::new()
@@ -91,30 +114,43 @@ $dragGrip.BackColor = [Drawing.Color]::FromArgb(16, 84, 82)
 $dragGrip.ForeColor = [Drawing.Color]::White
 $dragGrip.Cursor = [Windows.Forms.Cursors]::SizeAll
 $dragGrip.SetBounds(210, 0, 46, 46)
-$dragGrip.Add_MouseDown({
-    param($sender, $mouse)
-    if ($mouse.Button -ne [Windows.Forms.MouseButtons]::Left) { return }
-    $point = $sender.PointToScreen($mouse.Location)
-    $drag.X = $point.X - $window.Left
-    $drag.Y = $point.Y - $window.Top
-    $drag.Active = $true
-    $dragGrip.Capture = $true
-})
-$dragGrip.Add_MouseMove({
-    param($sender, $mouse)
-    if (!$drag.Active) { return }
-    $point = $sender.PointToScreen($mouse.Location)
-    $workArea = [Windows.Forms.Screen]::FromPoint($point).WorkingArea
-    Move-ReminderHud ($point.X - $drag.X) ($point.Y - $drag.Y) $workArea
-})
-$dragGrip.Add_MouseUp({
-    param($sender, $mouse)
-    if ($mouse.Button -eq [Windows.Forms.MouseButtons]::Left) {
-        $drag.Active = $false
-        $dragGrip.Capture = $false
-    }
-})
-$dragGrip.Add_MouseCaptureChanged({ if (!$dragGrip.Capture) { $drag.Active = $false } })
+function Register-ReminderDrag($Control) {
+    $Control.Add_MouseDown({
+        param($sender, $mouse)
+        if ($mouse.Button -ne [Windows.Forms.MouseButtons]::Left) { return }
+        if ($CodexLocal -and $sender -eq $localChrome.Band -and $mouse.Y -ge $header.Height) { return }
+        $point = $sender.PointToScreen($mouse.Location)
+        $drag.X = $point.X - $window.Left
+        $drag.Y = $point.Y - $window.Top
+        $drag.Active = $true
+        $drag.Moved = $false
+        $sender.Capture = $true
+    })
+    $Control.Add_MouseMove({
+        param($sender, $mouse)
+        if (!$drag.Active -or !$sender.Capture) { return }
+        $point = $sender.PointToScreen($mouse.Location)
+        $dx=$point.X-$drag.X-$window.Left; $dy=$point.Y-$drag.Y-$window.Top
+        if (!$drag.Moved -and [Math]::Abs($dx) -lt [Windows.Forms.SystemInformation]::DragSize.Width/2 -and
+            [Math]::Abs($dy) -lt [Windows.Forms.SystemInformation]::DragSize.Height/2) { return }
+        if ($dx -eq 0 -and $dy -eq 0) { return }
+        $drag.Moved = $true
+        $workArea = [Windows.Forms.Screen]::FromPoint($point).WorkingArea
+        Move-ReminderHud ($point.X - $drag.X) ($point.Y - $drag.Y) $workArea
+    })
+    $Control.Add_MouseUp({
+        param($sender, $mouse)
+        if ($mouse.Button -eq [Windows.Forms.MouseButtons]::Left) {
+            $moved=$drag.Active -and $drag.Moved
+            $release=$sender.PointToScreen($mouse.Location)
+            $drag.Active = $false
+            $sender.Capture = $false
+            if ($CodexLocal -and $moved) { Complete-LocalHudDrag $release }
+        }
+    })
+    $Control.Add_MouseCaptureChanged({ if (!$this.Capture) { $drag.Active = $false } })
+}
+Register-ReminderDrag $dragGrip
 $window.Controls.Add($dragGrip)
 
 $menu = [Windows.Forms.ContextMenuStrip]::new()
@@ -197,12 +233,19 @@ $window.Controls.Add($menuButton)
 $list = if ($CodexLocal) {
     Initialize-LocalHudTypes
     [JieShou.SessionListPanel]::new()
-} else { [Windows.Forms.FlowLayoutPanel]::new() }
+} else {
+    if (!('JieShou.HudGeometry' -as [type])) { Add-Type -Path "$PSScriptRoot/Reminder.HudGeometry.cs" }
+    [Windows.Forms.FlowLayoutPanel]::new()
+}
 $list.SetBounds(8, 52, 412, 388)
 $list.FlowDirection = 'TopDown'
 $list.WrapContents = $false
 $list.AutoScroll = $true
-$window.Controls.Add($list)
+if ($CodexLocal) {
+    $localScrollBar=[JieShou.HudScrollBar]::new($list)
+    $localScrollBar.Name='session-scroll'
+    $window.Controls.Add($localScrollBar)
+} else { $window.Controls.Add($list) }
 
 function New-TargetWindow($Target) {
     $dialog = [Windows.Forms.Form]::new()
@@ -394,7 +437,7 @@ try {
         $tray = [Windows.Forms.NotifyIcon]::new()
         $trayIcon = [Drawing.Icon]::new((Join-Path $PSScriptRoot 'assets/amc-message-grip.ico'),[Windows.Forms.SystemInformation]::SmallIconSize)
         $tray.Icon = $trayIcon
-        $tray.Text = '智能体消息中心'
+        $tray.Text = 'AMC · 智能体消息中心'
         $tray.ContextMenuStrip = $trayMenu
         $tray.Add_DoubleClick({ Toggle-ReminderHudVisibility })
         $tray.Visible = $true
@@ -419,6 +462,7 @@ try {
         $localTimer.Add_Tick({
             Update-LocalNavigation
             if ($localChrome.Surface.IsRevealing) { return }
+            Update-LocalDockHover
             Update-DshAttention; Update-QoderAttention; Update-LocalSessionList
             $localChrome.ActivityAnimation.Refresh()
         })
@@ -433,6 +477,7 @@ try {
         [Windows.Forms.Application]::Run($window)
     }
 } finally {
+    if ($CodexLocal -and $localChrome.OutsideClicks) { $localChrome.OutsideClicks.Dispose() }
     if ($localTimer) { $localTimer.Dispose(); Stop-LocalNavigation; Stop-LocalSessionRead }
     if ($codexTimer) { $codexTimer.Dispose() }
     if ($tray) { $tray.Visible = $false; $tray.Dispose() }

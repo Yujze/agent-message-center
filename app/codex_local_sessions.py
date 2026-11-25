@@ -1,6 +1,8 @@
 """Read local session metadata and outstanding input requests for the Windows HUD."""
 from contextlib import closing
+from datetime import datetime
 import json
+import mmap
 import os
 from pathlib import Path
 import sqlite3
@@ -17,11 +19,84 @@ def columns(db, schema, table):
     return {r[1] for r in db.execute(f"PRAGMA {schema}.table_info({table})")}
 
 
-def catalog_time(fields, name):
-    options = [col for col in [name + "_ms"] if col in fields]
+def catalog_time(fields, name, prefix=""):
+    options = [prefix + col for col in [name + "_ms"] if col in fields]
     if name in fields:
-        options.append(f"{name} * 1000")
+        options.append(f"{prefix}{name} * 1000")
     return "COALESCE(" + ", ".join(options + ["NULL"]) + ")" if options else "NULL"
+
+
+def codex_desktop_unread(codex_home):
+    # The desktop can mark a chat unread independently of the server receipt.
+    # Do not merge identities, remote hosts or the old migration snapshot.
+    try:
+        with closing(open_index(codex_home / ".codex-global-state.sqlite")) as db:
+            result = db.execute("SELECT value FROM settings WHERE scope='global' AND key='electron-thread-read-state-v1'").fetchone()
+        if result:
+            state = json.loads(result[0])
+            if state.get("version") == 1 and len(state["unreadByIdentity"]) == 1:
+                hosts = next(iter(state["unreadByIdentity"].values()))
+                local = [ids for key, ids in hosts.items() if key == "local" or key.startswith("local:")]
+                if len(local) == 1 and isinstance(local[0], list):
+                    return {ident for ident in local[0] if isinstance(ident, str)}
+    except (sqlite3.Error, OSError, ValueError, TypeError, AttributeError, KeyError):
+        pass
+    return set()
+
+
+def latest_rollout_boundary(log, lower):
+    # Ignore an incomplete write at EOF. Work backwards across complete records
+    # without copying large tool outputs into Python memory.
+    states = {"task_started": "inProgress", "task_complete": "completed", "turn_aborted": "interrupted"}
+    markers = tuple(json.dumps(kind).encode() for kind in states)
+    end = log.rfind(b"\n", lower)
+    while end > lower:
+        offset = log.rfind(b"\n", lower - 1, end) + 1
+        if offset < lower:
+            break
+        line_end, end = end, offset - 1
+        if log.find(b'"event_msg"', offset, line_end) < 0 or not any(
+                log.find(tag, offset, line_end) >= 0 for tag in markers):
+            continue
+        record = json.loads(log[offset:line_end])
+        event = record.get("payload")
+        if record.get("type") != "event_msg" or not isinstance(event, dict) or event.get("type") not in states:
+            continue
+        turn_id = event.get("turn_id")
+        when = datetime.fromisoformat(record["timestamp"].replace("Z", "+00:00"))
+        if isinstance(turn_id, str) and turn_id and when.tzinfo is not None:
+            return states[event["type"]], turn_id, int(when.timestamp() * 1000), offset, bool(event.get("last_agent_message"))
+        break
+    return None
+
+
+def codex_rollout_turn(path, thread_id, projected_end, indexed_at, check_receipt, receipt_turn):
+    """Recover the latest durable turn boundary when history trails or points outside this rollout."""
+    if not isinstance(path, str) or not Path(path).is_absolute() or Path(path).suffix.lower() != ".jsonl":
+        return None
+    try:
+        with Path(path).open("rb") as stream:
+            size = os.fstat(stream.fileno()).st_size
+            if not size or (size == projected_end and not check_receipt):
+                return None
+            header = json.loads(stream.readline(1024 * 1024))
+            if header.get("type") != "session_meta" or header["payload"]["id"] != thread_id:
+                return None
+            lower = stream.tell()
+            if not check_receipt and projected_end is not None and lower < projected_end < size:
+                lower = projected_end
+            with mmap.mmap(stream.fileno(), size, access=mmap.ACCESS_READ) as log:
+                boundary = latest_rollout_boundary(log, lower)
+            if boundary:
+                state, turn_id, stamp, _, _ = boundary
+                if (check_receipt and projected_end in (None, size) and state == "completed"
+                        and receipt_turn and turn_id != receipt_turn):
+                    return None
+                if stamp > 0 and stamp >= indexed_at:
+                    return boundary
+    except (OSError, ValueError, TypeError, AttributeError, KeyError, OverflowError):
+        pass
+    return None
 
 
 def codex_sync_input_pending(projected, path, offset, turn_id):
@@ -141,17 +216,22 @@ def set_codex_side_chat_roots(sessions):
 
 
 def session_snapshot(codex_home):
+    desktop_unread = codex_desktop_unread(codex_home)
     with closing(open_index(codex_home / "state_5.sqlite")) as db:
         fields = columns(db, "main", "threads")
         parent = "attached_thread_parent_id" if "attached_thread_parent_id" in fields else "NULL"
         rollout = "threads.rollout_path" if "rollout_path" in fields else "NULL"
         created = catalog_time(fields, "created_at")
         updated = catalog_time(fields, "updated_at")
-        status = message = finished = unread = offset = "NULL"
+        status = message = finished = unread = offset = started = first_unread = published = projected_end = "NULL"
         joins = ""
-        if {"thread_id", "first_unread_turn"} <= columns(db, "main", "thread_read_receipts"):
+        receipt_fields = columns(db, "main", "thread_read_receipts")
+        if {"thread_id", "first_unread_turn"} <= receipt_fields:
             joins += " LEFT JOIN thread_read_receipts rr ON rr.thread_id=threads.id"
             unread = "CASE WHEN rr.thread_id IS NOT NULL THEN NULLIF(TRIM(rr.first_unread_turn),'') IS NOT NULL END"
+            first_unread = "rr.first_unread_turn"
+            if "last_published_turn" in receipt_fields:
+                published = "rr.last_published_turn"
         history_available = False
         turn_id = "NULL"
         sync_query = None
@@ -159,18 +239,21 @@ def session_snapshot(codex_home):
         try:
             history = (codex_home / "thread_history_1.sqlite").resolve().as_uri() + "?mode=ro"
             db.execute("ATTACH DATABASE ? AS history", (history,))
+            if {"thread_id", "next_rollout_byte_offset"} <= columns(db, "history", "thread_history_projection_state"):
+                joins += " LEFT JOIN history.thread_history_projection_state hp ON hp.thread_id=threads.id"
+                projected_end = "hp.next_rollout_byte_offset"
             turn_fields = columns(db, "history", "thread_turns")
             history_available = {"status", "thread_id", "rollout_ordinal"} <= turn_fields
             if history_available:
                 joins += """ LEFT JOIN history.thread_turns last ON last.thread_id=threads.id AND
                     last.rollout_ordinal=(SELECT MAX(t.rollout_ordinal) FROM history.thread_turns t WHERE t.thread_id=threads.id)"""
                 status = "last.status"
+                started = catalog_time(turn_fields, "started_at", "last.")
                 if "turn_id" in turn_fields:
                     turn_id = "last.turn_id"
                 if "rollout_byte_offset" in turn_fields:
                     offset = "last.rollout_byte_offset"
-                if "completed_at" in turn_fields:
-                    finished = "CASE WHEN last.status='completed' THEN last.completed_at*1000 END"
+                finished = catalog_time(turn_fields, "completed_at", "last.")
             parts, requests = [], []
             for table in ("thread_items", "thread_realtime_items"):
                 keys = columns(db, "history", table)
@@ -201,10 +284,12 @@ def session_snapshot(codex_home):
             pass
         db.execute("BEGIN")
         rows = db.execute(f"""SELECT threads.id, {created}, {updated}, threads.name, {status}, {message},
-                              {finished}, {unread}, {turn_id}, {parent}, {rollout}, {offset} FROM threads {joins} WHERE archived=0 AND source='vscode'
+                              {finished}, {unread}, {turn_id}, {parent}, {rollout}, {offset},
+                              {first_unread}, {published}, {started}, {projected_end} FROM threads {joins} WHERE archived=0 AND source='vscode'
                               ORDER BY updated_at DESC, id DESC""").fetchall()
         sessions = []
-        for ident, created_ms, updated_ms, name, turn, msg, finished_ms, unread_flag, active_turn, parent_id, path, start in rows:
+        for (ident, created_ms, updated_ms, name, turn, msg, finished_ms, unread_flag, active_turn,
+             parent_id, path, start, first_unread_id, published_id, started_ms, cursor) in rows:
             try:
                 parsed = UUID(ident)
                 if str(parsed) != ident or not parsed.int:
@@ -212,6 +297,27 @@ def session_snapshot(codex_home):
             except (TypeError, ValueError, AttributeError):
                 continue
             turn = turn if turn in {"inProgress", "completed", "interrupted", "failed"} else "unknown"
+            desktop_marked = ident in desktop_unread
+            if desktop_marked:
+                unread_flag = 1
+            indexed_at = max(started_ms or 0, finished_ms or 0)
+            if turn != "completed":
+                finished_ms = None
+            receipt_turn = published_id or first_unread_id
+            missing_completion = turn != "completed" or not finished_ms or (receipt_turn and receipt_turn != active_turn)
+            check_receipt = bool(receipt_turn or desktop_marked) and missing_completion
+            if cursor is not None or check_receipt or (updated_ms or 0) > indexed_at:
+                boundary = codex_rollout_turn(path, ident, cursor, indexed_at, check_receipt, receipt_turn)
+                if boundary:
+                    state, event_turn, stamp, event_offset, has_message = boundary
+                    if state != "inProgress" or event_turn != active_turn or turn in ("unknown", "inProgress"):
+                        turn, active_turn = state, event_turn
+                        finished_ms = stamp if state == "completed" else None
+                        if state == "inProgress":
+                            start = event_offset
+                        elif state == "completed" and has_message:
+                            msg = max(msg or 0, stamp)
+                        indexed_at = stamp
             waiting = None
             if turn == "inProgress" and active_turn:
                 projected = dict(db.execute(sync_query, (ident, active_turn))) if sync_query else {}
@@ -219,7 +325,7 @@ def session_snapshot(codex_home):
                         or codex_async_input_pending(db, async_tables, ident, active_turn)):
                     waiting = 1
             sessions.append(dict(agent="Codex", id=ident, name=" ".join((name or "")[:80].split()), turn=turn,
-                                 created=created_ms, message=msg or None, activity=max(msg or 0, created_ms or 0, finished_ms or 0),
+                                 created=created_ms, message=msg or None, activity=max(msg or 0, created_ms or 0, indexed_at),
                                  finished=finished_ms, unread=unread_flag, needsInput=waiting,
                                  updated=(updated_ms or 0) // 1000))
             if name and name != sessions[-1]["name"]:
@@ -254,14 +360,30 @@ def qoder_sessions(path):
     return result
 
 
+def qoder_active_turns(path):
+    # Qoder stages assistant/tool items here before it materializes the assistant message.
+    # A pending final projection already owns that turn, even before the main DB catches up.
+    try:
+        with closing(open_index(path)) as db:
+            return {(sid, turn): started for sid, turn, started in db.execute("""
+                SELECT a.session_id,a.turn_id,MIN(a.created_at) FROM active_turn_projection_items a
+                WHERE NOT EXISTS (SELECT 1 FROM pending_turn_projections p
+                    WHERE p.session_id=a.session_id AND p.turn_id=a.turn_id)
+                GROUP BY a.session_id,a.turn_id
+            """) if isinstance(started, int) and started > 0}
+    except (sqlite3.Error, OSError):
+        return {}
+
+
 def qoder_app_sessions(path):
+    active = qoder_active_turns(path.with_name("chat-session-turn-payload-buffer.sqlite"))
     with closing(open_index(path)) as db:
         # Older messages without projected role metadata still contribute through
         # the sidebar update time. Never unpack message payloads to infer a role.
         fields = columns(db, "main", "chat_session_messages")
         session_fields = columns(db, "main", "chat_sessions")
         unread = "s.unread" if "unread" in session_fields else "NULL"
-        message = turn_status = turn_time = "NULL"
+        message = turn_status = turn_time = latest_turn = "NULL"
         latest_join = ""
         if {"session_id", "role", "created_at"} <= fields:
             stamp = "COALESCE(m.created_at,0)"
@@ -277,27 +399,36 @@ def qoder_app_sessions(path):
                             f"json_extract({alias}.payload_json,'$.role') END)")
                 return f"{alias}.role"
             # Use the same latest user/assistant turn and assistant status as the desktop sidebar.
-            local = " AND m.source != 'peer-projection'" if "source" in fields else ""
-            latest_join = f""" LEFT JOIN chat_session_messages last ON last.session_id=s.session_id
-                AND last.message_id=(SELECT m.message_id FROM chat_session_messages m
-                  WHERE m.session_id=s.session_id {local} AND {role('m')}='assistant'
-                    AND m.turn_id=(SELECT m.turn_id FROM chat_session_messages m WHERE m.session_id=s.session_id
+            local = " AND m.source IS NOT 'peer-projection'" if "source" in fields else ""
+            latest_join = f""" LEFT JOIN chat_session_messages recent ON recent.session_id=s.session_id
+                AND recent.message_id=(SELECT m.message_id FROM chat_session_messages m WHERE m.session_id=s.session_id
                       {local} AND NULLIF(TRIM(m.turn_id),'') IS NOT NULL AND {role('m')} IN ('user','assistant')
                       ORDER BY m.sequence DESC LIMIT 1)
+                LEFT JOIN chat_session_messages last ON last.session_id=s.session_id
+                AND last.message_id=(SELECT m.message_id FROM chat_session_messages m
+                  WHERE m.session_id=s.session_id {local} AND {role('m')}='assistant' AND m.turn_id=recent.turn_id
                   ORDER BY m.sequence DESC LIMIT 1)"""
+            latest_turn = "recent.turn_id"
             turn_status = "last.status"
             turn_time = "COALESCE(NULLIF(last.updated_at,0),last.created_at)" if "updated_at" in fields else "last.created_at"
         rows = db.execute(f"""
-            SELECT s.session_id, s.title, s.created_at, s.updated_at, {message}, {turn_status}, {turn_time}, {unread}
+            SELECT s.session_id, s.title, s.created_at, s.updated_at, {message}, {turn_status}, {turn_time}, {unread}, {latest_turn}
             FROM chat_sessions s {latest_join} WHERE s.session_kind='standard' AND COALESCE(s.archived,0)=0
               AND COALESCE(s.deleted_at,0)=0 AND COALESCE(s.archived_at,0)=0
             ORDER BY s.session_id
         """).fetchall()
-    return [dict(agent="Qoder", id=ident, name=(title or "")[:80], desktop=True, created=created,
+    result = []
+    for ident, title, created, updated, msg, status, stamp, flag, turn in rows:
+        if not ident:
+            continue
+        row = dict(agent="Qoder", id=ident, name=(title or "")[:80], desktop=True, created=created,
                  message=msg or None, activity=max(created or 0, updated or 0, msg or 0),
                  turn={"completed":"completed","interrupted":"interrupted","failed":"failed","streaming":"inProgress"}.get(status,"unknown"),
                  finished=stamp if status == "completed" else None, unread=flag)
-            for ident, title, created, updated, msg, status, stamp, flag in rows if ident]
+        if status is None and (ident, turn) in active:
+            row["bufferedSince"] = active[ident, turn]
+        result.append(row)
+    return result
 
 
 def qoder_catalog(roaming):
@@ -323,6 +454,7 @@ def qoder_catalog(roaming):
             if (row["message"] or 0) > previous["activity"]:
                 # An IDE message can advance a shared conversation beyond the desktop receipt.
                 previous.update(turn="unknown", unread=None, finished=None)
+                previous.pop("bufferedSince", None)
             times = [t for t in (previous["created"], row["created"]) if t]
             previous["created"] = min(times, default=None)
             previous["activity"] = max(previous["activity"], row["activity"])

@@ -64,7 +64,8 @@ namespace JieShou {
             e.Graphics.DrawRectangle(pen,0,0,e.ToolStrip.Width-1,e.ToolStrip.Height-1);
         }
         protected override void OnRenderMenuItemBackground(ToolStripItemRenderEventArgs e) {
-            ChoiceRow.Paint(e.Graphics,new Rectangle(Point.Empty,e.Item.Size),e.Item.Text,e.Item.Font,colors,dpi,false,e.Item.Selected);
+            ChoiceRow.Paint(e.Graphics,new Rectangle(Point.Empty,e.Item.Size),e.Item.Text,e.Item.Font,colors,dpi,
+                e.Item is ToolStripMenuItem command && command.Checked,e.Item.Selected);
         }
         protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e) { }
     }

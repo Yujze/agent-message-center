@@ -41,19 +41,31 @@ function Get-SessionGroups($Rows,$AttentionLabels) {
             $g.Children.Add($session)
             if ($label -ceq '待输入') { $g.Waiting++ }
             elseif ($label -ceq '完成未读') { $g.Unread++ }
-            elseif ($session.turn -ceq 'inProgress') { $g.Running++ }
+            elseif ($label -ceq '进行中') { $g.Running++ }
         } else { $g.Matched=$true }
     }
     $groups
 }
 
 function Get-SessionPage($Groups) {
-    foreach ($g in $Groups | Select-Object -Skip ($localView.Page*12) -First 12) {
-        @{ Session=$g.Head; Group=$g; ContextOnly=!$g.Matched; Priority=$g.Priority }
-        if ($g.Children.Count -and $localChrome.ExpandedGroups.Contains($g.Head.id)) {
-            foreach ($child in $g.Children) { @{ Session=$child; Priority=$g.Priority } }
+    $page = if ($localView.Attention -ceq '进行中') { $Groups } else { $Groups | Select-Object -Skip ($localView.Page*12) -First 12 }
+    foreach ($g in $page) {
+        @{ Session=$g.Head; Group=$g; ContextOnly=!$g.Matched; Priority=$g.Priority; Branch='None' }
+        if ($g.Children.Count -and ($localView.Attention -or $localChrome.ExpandedGroups.Contains($g.Head.id))) {
+            $lastId=$g.Children[$g.Children.Count-1].id
+            foreach ($child in $g.Children) {
+                @{ Session=$child; Priority=$g.Priority; Branch=if ($child.id -ceq $lastId) { 'Last' } else { 'Through' } }
+            }
         }
     }
+}
+
+function Open-LocalSessionList($Category) {
+    $localView.Attention=if ($Category -ne '总数') { $Category }
+    $localView.Page=0
+    $list.AutoScrollPosition=[Drawing.Point]::Empty
+    $script:expanded=$true
+    Update-ReminderWindow
 }
 
 function Set-SessionSelection($Kind,$Value) {
@@ -62,6 +74,35 @@ function Set-SessionSelection($Kind,$Value) {
     $localView.Page = 0
     $list.AutoScrollPosition = [Drawing.Point]::Empty
     Update-ReminderWindow
+}
+
+function Set-SessionStatusLayout($Left,$Top,$Width,$Attention,[bool]$Ready) {
+    $gap=Get-HudPixels 4
+    $x=$Left; $y=$Top
+    $buttons=@($localChrome.AllSessions)+$localChrome.ReminderFilters
+    foreach ($tab in $buttons) {
+        $kind=$tab.Tag
+        $caption=if (!$kind) { '全部会话' } elseif ($Ready) { "$kind $($Attention.Reminders[$kind].Count)" } else { $kind }
+        $tab.Text=$tab.AccessibleName=$caption
+        $selected=if ($kind) { $kind -ceq $localView.Attention } else { !$localView.Attention }
+        $tab.Enabled=$selected -or !$kind -or !$Ready -or $Attention.Reminders[$kind].Count -gt 0
+        if ($tab.Selected -ne $selected) { $tab.Selected=$selected; $tab.Invalidate() }
+        $tab.Visible=$true
+        $tab.Palette=$hudColors; $tab.BackColor=$hudColors.Chrome
+        $tab.ForeColor=switch ($kind) {
+            '待输入' { $hudColors.InputInk }
+            '完成未读' { $hudColors.Unread }
+            '进行中' { $hudColors.VerticalRunningInk }
+            default { $hudColors.Ink }
+        }
+        $measure=[Windows.Forms.TextRenderer]::MeasureText($caption,$tab.Font)
+        $w=[Math]::Min($Width,$measure.Width+(Get-HudPixels 12))
+        $h=[Math]::Max($measure.Height,$tab.Font.Height)+(Get-HudPixels 8)
+        if ($x -gt $Left -and $x+$w -gt $Left+$Width) { $x=$Left; $y+=$h+$gap }
+        $tab.SetBounds($x,$y,$w,$h)
+        $x+=$w+$gap
+    }
+    return $tab.Bottom+$gap
 }
 
 function Initialize-SessionFilters {

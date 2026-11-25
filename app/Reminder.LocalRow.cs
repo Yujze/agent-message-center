@@ -7,6 +7,27 @@ using System.Windows.Forms;
 
 namespace JieShou {
     public enum SessionIndicator { None, Attention, Running, CompletedUnread }
+    public enum SideChatBranch { None, Through, Last }
+
+    internal static class SideChatTree {
+        public const int ParentText = 37, ChildText = 59;
+
+        // Both controls paint the same rail up to their edge, including for wrapped titles.
+        public static void Draw(Graphics g, Color color, int dpi, int middle, int height, bool continues) {
+            float scale = dpi / 96f, x = (float)Math.Round(ParentText * scale), radius = 5 * scale;
+            float bend = middle - radius;
+            var saved = g.Save();
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            using var pen = new Pen(color, Math.Max(1f, scale));
+            using var path = new GraphicsPath();
+            path.AddLine(x, 0, x, bend);
+            path.AddArc(x, bend-radius, 2*radius, 2*radius, 180, -90);
+            path.AddLine(x+radius, middle, x+14*scale, middle);
+            g.DrawPath(pen, path);
+            if (continues) g.DrawLine(pen, x, bend, x, height);
+            g.Restore(saved);
+        }
+    }
 
     public sealed class SessionActivityAnimation {
         private readonly FlowLayoutPanel list;
@@ -69,32 +90,46 @@ namespace JieShou {
             if(unseen>0) parts.Add(unseen+" 完成未读");
             if(running>0) parts.Add(running+" 进行中");
             var status=String.Join("  ·  ",parts);
-            string caption="侧聊 "+count;
+            string caption=count+" 个侧聊";
             if (colors==palette && summary==status && Text==caption && open==expanded && Font==font && dpi==scale) return;
             colors=palette; dpi=scale; Font=font; Text=caption; open=expanded;
             summary=status; waiting=input>0; unread=unseen>0; BackColor=colors.Surface;
-            AccessibleName=(open ? "收起" : "展开")+caption+(status.Length==0 ? "" : "，"+status);
-            Height=Math.Max(D(31),font.Height+D(12)); Invalidate();
+            AccessibleName=(open ? "收起 " : "展开 ")+caption+(status.Length==0 ? "" : "，"+status);
+            Invalidate();
         }
         protected override void OnMouseEnter(EventArgs e) {base.OnMouseEnter(e);hover=true;Invalidate();}
         protected override void OnMouseLeave(EventArgs e) {base.OnMouseLeave(e);hover=false;Invalidate();}
+        private const TextFormatFlags CaptionFlags=TextFormatFlags.VerticalCenter|TextFormatFlags.NoPadding|TextFormatFlags.SingleLine|TextFormatFlags.NoPrefix;
+        private const TextFormatFlags SummaryFlags=TextFormatFlags.WordBreak|TextFormatFlags.NoPadding|TextFormatFlags.NoPrefix|TextFormatFlags.TextBoxControl;
+        private (int Height,int CaptionWidth,int Line,Rectangle Summary) LayoutSummary(Graphics g,int width) {
+            int x=D(SideChatTree.ChildText), line=Math.Max(D(28),Font.Height+D(10));
+            int caption=TextRenderer.MeasureText(g,Text,Font,Size.Empty,CaptionFlags).Width;
+            int start=x+caption+D(20)+Math.Max(2,D(3)), right=width-D(6);
+            if(summary.Length==0 || TextRenderer.MeasureText(g,summary,Font,Size.Empty,CaptionFlags).Width<=right-start)
+                return (line,caption,line,new Rectangle(start,0,Math.Max(1,right-start),line));
+            int room=Math.Max(1,right-x);
+            int h=TextRenderer.MeasureText(g,summary,Font,new Size(room,int.MaxValue),SummaryFlags).Height;
+            return (line+h+D(4),caption,line,new Rectangle(x,line,room,h));
+        }
+        public int ContentHeight(int width) {
+            using var g=CreateGraphics(); return LayoutSummary(g,width).Height;
+        }
         protected override void OnPaint(PaintEventArgs e) {
             if(colors==null) return;
             var g=e.Graphics; g.Clear(colors.Surface); g.SmoothingMode=SmoothingMode.AntiAlias;
-            var flags=TextFormatFlags.VerticalCenter|TextFormatFlags.NoPadding|TextFormatFlags.SingleLine|TextFormatFlags.NoPrefix;
-            int x=D(37), y=D(1), h=Height-D(6);
-            int w=TextRenderer.MeasureText(g,Text,Font,Size.Empty,flags).Width+D(34);
-            using var tile=MetricPill.Outline(new RectangleF(x,y,w,h),h/2f);
-            using var fill=new SolidBrush(hover ? colors.Hover : colors.Track); g.FillPath(fill,tile);
-            int cx=x+D(12), cy=y+h/2, k=Math.Max(2,D(3));
-            using var pen=new Pen(colors.Muted,Math.Max(1,dpi/72f)){LineJoin=LineJoin.Round,StartCap=LineCap.Round,EndCap=LineCap.Round};
-            g.DrawLines(pen,open ? new[]{new Point(cx-k,cy-k/2),new Point(cx,cy+k/2),new Point(cx+k,cy-k/2)}
-                                : new[]{new Point(cx-k/2,cy-k),new Point(cx+k/2,cy),new Point(cx-k/2,cy+k)});
-            TextRenderer.DrawText(g,Text,Font,new Rectangle(x+D(23),y,w-D(23),h),colors.Ink,flags);
-            int meta=x+w+D(9);
-            TextRenderer.DrawText(g,summary,Font,new Rectangle(meta,y,Math.Max(1,Width-meta-D(6)),h),
-                waiting ? colors.Accent : unread ? colors.Unread : colors.Muted,flags|TextFormatFlags.EndEllipsis);
-            if(Focused && ShowFocusCues){using var focus=new Pen(colors.Action,Math.Max(1,D(1)));g.DrawPath(focus,tile);}
+            var layout=LayoutSummary(g,Width);
+            int x=D(SideChatTree.ChildText), cy=layout.Line/2;
+            SideChatTree.Draw(g,colors.Line,dpi,cy,Height,open);
+            int width=layout.CaptionWidth;
+            var ink=hover ? colors.Ink : colors.Accent;
+            TextRenderer.DrawText(g,Text,Font,new Rectangle(x,0,width,layout.Line),ink,CaptionFlags);
+            int cx=x+width+D(8), k=Math.Max(2,D(3)), dy=open ? -k : k;
+            using var pen=new Pen(ink,Math.Max(1,dpi/72f)){LineJoin=LineJoin.Round,StartCap=LineCap.Round,EndCap=LineCap.Round};
+            g.DrawLines(pen,new[]{new Point(cx-k,cy-dy/2),new Point(cx,cy+dy/2),new Point(cx+k,cy-dy/2)});
+            TextRenderer.DrawText(g,summary,Font,layout.Summary,waiting ? colors.InputInk : unread ? colors.Unread : colors.Muted,
+                layout.Summary.Top==0 ? CaptionFlags : SummaryFlags);
+            if(Focused && ShowFocusCues)
+                ControlPaint.DrawFocusRectangle(g,new Rectangle(x-D(3),D(2),cx+k+D(7)-x,Height-2*D(2)),colors.Action,BackColor);
         }
     }
 
@@ -109,6 +144,8 @@ namespace JieShou {
         public SessionIndicator Indicator { get; set; }
         public bool ShowDivider { get; set; } = true;
         private bool hover, side, groupHead;
+        private SideChatBranch branch;
+        private int TextLeft => Dip(branch == SideChatBranch.None ? SideChatTree.ParentText : SideChatTree.ChildText);
         private readonly System.Collections.Generic.Dictionary<int,int> heights=new System.Collections.Generic.Dictionary<int,int>();
         public int LayoutDpi { get; set; }
         public HudColors Colors { get; set; }
@@ -125,11 +162,12 @@ namespace JieShou {
             DoubleBuffered = true;
         }
         public void Bind(string title,string agent,string detail,string time,string description,SessionIndicator indicator,
-                         bool canOpen,Image icon,HudColors colors,Font titleFont,Font detailFont,int dpi,bool sideChat,bool group) {
+                         bool canOpen,Image icon,HudColors colors,Font titleFont,Font detailFont,int dpi,bool sideChat,bool group,SideChatBranch position) {
             if (Text==title && Agent==agent && Detail==detail && TimeText==time && AccessibleDescription==description &&
                 Indicator==indicator && CanOpen==canOpen && Image==icon && Colors==colors && TitleFont==titleFont &&
-                DetailFont==detailFont && LayoutDpi==dpi && side==sideChat && groupHead==group) return;
-            if (Text!=title || Indicator!=indicator || TitleFont!=titleFont || DetailFont!=detailFont || LayoutDpi!=dpi || side!=sideChat || groupHead!=group) heights.Clear();
+                DetailFont==detailFont && LayoutDpi==dpi && side==sideChat && groupHead==group && branch==position) return;
+            if (Text!=title || Agent!=agent || Detail!=detail || TimeText!=time || Indicator!=indicator || CanOpen!=canOpen || TitleFont!=titleFont || DetailFont!=detailFont || LayoutDpi!=dpi || side!=sideChat || groupHead!=group || branch!=position) heights.Clear();
+            branch=position;
             side=sideChat; groupHead=group;
             Text=title; Agent=agent; Detail=detail; TimeText=time; Indicator=indicator; CanOpen=canOpen;
             Image=icon; Colors=colors; TitleFont=titleFont; DetailFont=detailFont; LayoutDpi=dpi;
@@ -141,43 +179,64 @@ namespace JieShou {
             Invalidate();
         }
         private Size TitleSize(Graphics graphics,int rowWidth) {
-            int width = Math.Max(1, rowWidth - Dip(side ? 84 : 69));
+            int width = Math.Max(1, rowWidth - TextLeft - Dip(32));
             return TextRenderer.MeasureText(graphics, Text, TitleFont, new Size(width, int.MaxValue), TitleFlags);
         }
-        private int DetailHeight(Graphics g) {
-            int height = (int)Math.Ceiling(DetailFont.GetHeight(g));
-            return Indicator == SessionIndicator.CompletedUnread ? height + Dip(4) : height;
+        private const TextFormatFlags SingleLine = TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine;
+        private string StatusBadge => Indicator switch {
+            SessionIndicator.Attention => "待输入",
+            SessionIndicator.CompletedUnread => "完成未读",
+            _ => null
+        };
+        private (string Text, Rectangle Badge, Rectangle Label, Rectangle Stamp, int Height) LayoutDetail(Graphics g,int width,int top) {
+            int left=TextLeft, right=Math.Max(left+1,width-Dip(8));
+            string badge=StatusBadge;
+            string text=Detail;
+            if(badge!=null) {
+                text=side ? Agent+" 侧聊" : groupHead ? Agent+" 主会话" : Agent;
+                if(side && !CanOpen) text+=" · 主会话不可用";
+            }
+            Size Measure(string value) => TextRenderer.MeasureText(g,value,DetailFont,Size.Empty,SingleLine);
+            var stampSize=Measure(TimeText);
+            var labelSize=Measure(text);
+            int line=Math.Max(stampSize.Height,labelSize.Height)+(badge!=null ? Dip(4) : 0);
+            int badgeWidth=badge==null ? 0 : Measure(badge).Width+Dip(12);
+            int indent=badge!=null ? badgeWidth+Dip(7) : Indicator==SessionIndicator.Running ? Dip(18) : 0;
+            int labelLeft=left+indent;
+            bool stacked=labelLeft+labelSize.Width+Dip(8)+stampSize.Width>right;
+            int labelWidth=Math.Max(1,right-labelLeft-(stacked ? 0 : stampSize.Width+Dip(8)));
+            int labelHeight=stacked ? Math.Max(line,TextRenderer.MeasureText(g,text,DetailFont,new Size(labelWidth,int.MaxValue),TitleFlags).Height) : line;
+            int stampY=stacked ? top+labelHeight+Dip(2) : top;
+            var stamp=new Rectangle(Math.Max(left,right-stampSize.Width),stampY,Math.Min(right-left,stampSize.Width),line);
+            return (text,new Rectangle(left,top,badgeWidth,line),new Rectangle(labelLeft,top,labelWidth,labelHeight),stamp,stamp.Bottom-top);
         }
 
-        private int DrawUnreadBadge(Graphics g,int left,int top,int height,int available,TextFormatFlags flags) {
-            const string text = "完成未读";
-            int padding = Dip(6);
-            int width = Math.Min(available,TextRenderer.MeasureText(g,text,DetailFont,Size.Empty,flags & ~TextFormatFlags.EndEllipsis).Width + 2*padding);
-            if (width <= 2*padding) return left;
-            using var path = MetricPill.Outline(new RectangleF(left,top,width,height),Dip(6));
-            using var fill = new SolidBrush(Colors.UnreadSurface);
+        private void DrawStatusBadge(Graphics g,Rectangle badge) {
+            bool input=Indicator==SessionIndicator.Attention;
+            using var path=MetricPill.Outline(badge,Dip(6));
+            using var fill=new SolidBrush(input ? Colors.InputSurface : Colors.UnreadSurface);
             g.FillPath(fill,path);
-            TextRenderer.DrawText(g,text,DetailFont,new Rectangle(left+padding,top,width-2*padding,height),Colors.Unread,flags);
-            return left + width + Dip(7);
+            TextRenderer.DrawText(g,StatusBadge,DetailFont,badge,input ? Colors.InputInk : Colors.Unread,
+                SingleLine|TextFormatFlags.HorizontalCenter|TextFormatFlags.VerticalCenter);
         }
 
         public int ContentHeight() => ContentHeight(Width);
         public int ContentHeight(int width) {
             if (heights.TryGetValue(width,out int cached)) return cached;
             using var graphics=CreateGraphics();
-            int height=Dip(side ? 8 : 12)+TitleSize(graphics,width).Height+Dip(6)+DetailHeight(graphics)+Dip(groupHead ? 4 : side ? 8 : 12);
+            int height=Dip(side ? 8 : 12)+TitleSize(graphics,width).Height+Dip(6)+LayoutDetail(graphics,width,0).Height+Dip(groupHead ? 4 : side ? 8 : 12);
             if (heights.Count>=2) heights.Clear();
             heights[width]=height;
             return height;
         }
         private void DrawAgentIcon(Graphics g, int top) {
             if (Image == null) return;
-            int size = Dip(side ? 16 : 20);
+            int size = Dip(20);
             var saved = g.Save();
             try {
                 g.InterpolationMode = InterpolationMode.HighQualityBicubic;
                 g.PixelOffsetMode = PixelOffsetMode.Half;
-                g.DrawImage(Image, new Rectangle(Dip(side ? 28 : 6), top, size, size),
+                g.DrawImage(Image, new Rectangle(Dip(6), top, size, size),
                     0, 0, Image.Width, Image.Height, GraphicsUnit.Pixel);
             } finally { g.Restore(saved); }
         }
@@ -217,43 +276,25 @@ namespace JieShou {
                 return;
             }
             g.Clear(surface);
-            int left = Dip(side ? 52 : 37), top = Dip(side ? 8 : 12), titleHeight = TitleSize(g,Width).Height;
-            if(side) {
-                int branchX=Dip(15), end=top+TitleFont.Height/2;
-                using var branch=new Pen(Colors.Divider,Math.Max(1,Dip(1)));
-                g.DrawLine(branch,branchX,0,branchX,end); g.DrawLine(branch,branchX,end,Dip(22),end);
-            }
-            DrawAgentIcon(g, top + Math.Max(0,(TitleFont.Height - Dip(20))/2));
-            int detailHeight = DetailHeight(g);
-            TextRenderer.DrawText(g, Text, TitleFont, new Rectangle(left, top, Math.Max(1, Width - Dip(side ? 84 : 69)), titleHeight),
+            int left = TextLeft, top = Dip(side ? 8 : 12), titleHeight = TitleSize(g,Width).Height;
+            if (branch != SideChatBranch.None)
+                SideChatTree.Draw(g,Colors.Line,LayoutDpi,top+TitleFont.Height/2,Height,branch==SideChatBranch.Through);
+            else
+                DrawAgentIcon(g, top + Math.Max(0,(TitleFont.Height - Dip(20))/2));
+            TextRenderer.DrawText(g, Text, TitleFont, new Rectangle(left, top, Math.Max(1, Width-left-Dip(32)), titleHeight),
                 ForeColor, TitleFlags);
             int detailY = top + titleHeight + Dip(6);
             g.SmoothingMode = SmoothingMode.AntiAlias;
-            const TextFormatFlags meta = TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix |
-                TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis;
-            int right = Width - Dip(8);
-            int timeWidth = Math.Min(TextRenderer.MeasureText(g,TimeText,DetailFont,new Size(int.MaxValue,int.MaxValue),
-                                                          meta & ~TextFormatFlags.EndEllipsis).Width + Dip(2),
-                                     Math.Max(0,(right-left)/2));
-            string detailText = Detail;
-            int metaLeft = left;
+            var detail=LayoutDetail(g,Width,detailY);
+            int mid=detailY+detail.Badge.Height/2;
             if (Indicator == SessionIndicator.Running) {
-                indicatorBounds = new Rectangle(left,detailY+(detailHeight-Dip(13))/2,Dip(14),Dip(13));
+                indicatorBounds=new Rectangle(left,mid-Dip(13)/2,Dip(14),Dip(13));
                 DrawRunning(g);
-                metaLeft += Dip(18);
-            } else if (Indicator == SessionIndicator.CompletedUnread) {
-                metaLeft = DrawUnreadBadge(g,left,detailY,detailHeight,Math.Max(0,right-timeWidth-Dip(8)-left),meta);
-                detailText = side ? Agent+" 侧聊" : groupHead ? Agent+" 主会话" : Agent;
-            } else if (Indicator == SessionIndicator.Attention) {
-                using var dot = new SolidBrush(Colors.Accent);
-                g.FillEllipse(dot,left,detailY+(detailHeight-Dip(5))/2,Dip(5),Dip(5));
-                metaLeft += Dip(10);
+            } else if (detail.Badge.Width>0) {
+                DrawStatusBadge(g,detail.Badge);
             }
-            TextRenderer.DrawText(g, detailText, DetailFont,
-                new Rectangle(metaLeft,detailY,Math.Max(0,right-timeWidth-Dip(8)-metaLeft),detailHeight),
-                Colors.Muted,meta);
-            TextRenderer.DrawText(g, TimeText, DetailFont,new Rectangle(right-timeWidth,detailY,timeWidth,detailHeight),
-                Colors.Muted, meta | TextFormatFlags.Right);
+            TextRenderer.DrawText(g,detail.Text,DetailFont,detail.Label,Colors.Muted,TitleFlags|TextFormatFlags.VerticalCenter);
+            TextRenderer.DrawText(g,TimeText,DetailFont,detail.Stamp,Colors.Muted,SingleLine|TextFormatFlags.Right|TextFormatFlags.VerticalCenter);
             int x = Width - Dip(13), y = top + TitleFont.Height/2;
             if (CanOpen) using (var pen = new Pen(Colors.Muted, Math.Max(1, Dip(2)))) {
                 g.DrawLines(pen, new[] { new Point(x - Dip(3), y - Dip(5)), new Point(x + Dip(2), y),

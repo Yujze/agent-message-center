@@ -5,229 +5,224 @@ using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
 namespace JieShou {
-    // Both the flow panel and the font options own a Win32 vertical scrollbar.
-    // Keep their native scroll range, items, wheel and keyboard navigation.
-    public sealed class HudScrollBar : NativeWindow, IDisposable {
-        private readonly Control owner;
-        private readonly ScrollableControl panel;
-        private readonly ListBox choices;
-        private HudColors colors;
-        private bool hot, held, dragging;
-        private int gripOffset;
-        private IntPtr previousCapture;
-        private readonly Timer repeat = new Timer();
+    // The borderless content keeps its native ranges, keyboard, wheel and focus scrolling.
+    // Its parent clips it to the Win32 client rectangle. Only our sibling rails can paint the gutter.
+    public sealed class HudScrollBar : Panel {
+        private readonly Panel viewport = new Panel { TabStop=false };
+        private readonly Control content;
+        private readonly Rail vertical, horizontal;
+        private readonly ScrollObserver observer;
+        private HudColors palette;
+        private bool arranging;
 
-        public HudScrollBar(ScrollableControl panel) : this((Control)panel) {
-            this.panel = panel;
-            panel.HandleCreated += Attach;
-            if (panel.IsHandleCreated) Attach(panel,EventArgs.Empty);
+        public HudScrollBar(ScrollableControl content) : this((Control)content) { }
+        public HudScrollBar(ListBox content) : this((Control)content) { }
+        private HudScrollBar(Control content) {
+            this.content=content;
+            TabStop=false;
+            vertical=new Rail(this,true);
+            horizontal=new Rail(this,false);
+            viewport.Size=Size.Empty;
+            viewport.Controls.Add(content);
+            Controls.AddRange(new Control[]{viewport,vertical,horizontal});
+            observer=new ScrollObserver(this);
+            content.HandleCreated+=ContentCreated;
+            content.HandleDestroyed+=ContentDestroyed;
+            content.ClientSizeChanged+=ContentChanged;
+            content.BackColorChanged+=ContentChanged;
+            if(content.IsHandleCreated) ContentCreated(null,EventArgs.Empty);
         }
-        public HudScrollBar(ListBox choices) : this((Control)choices) {
-            this.choices=choices;
-            choices.HandleCreated+=Attach;
-            if (choices.IsHandleCreated) Attach(choices,EventArgs.Empty);
-        }
-        private HudScrollBar(Control owner) {
-            this.owner = owner;
-            owner.HandleDestroyed += Closed;
-            owner.Disposed += OwnerDisposed;
-            repeat.Tick += RepeatPage;
-        }
+        public int GutterWidth => GetSystemMetricsForDpi(2,(uint)content.DeviceDpi);
         public HudColors Palette {
-            set { colors = value; Refresh(); }
+            set { palette=value; UpdateRails(); }
         }
-        public int GutterWidth => GetSystemMetricsForDpi(2,(uint)owner.DeviceDpi); // SM_CXVSCROLL
-        private void Attach(object sender, EventArgs e) {
-            IntPtr target = owner.Handle;
-            if (Handle != target) {
-                Closed(null,EventArgs.Empty);
-                if (target != IntPtr.Zero) AssignHandle(target);
+        private void ContentCreated(object sender,EventArgs e) {
+            observer.AssignHandle(content.Handle);
+            UpdateRails();
+        }
+        private void ContentDestroyed(object sender,EventArgs e) {
+            if(observer.Handle!=IntPtr.Zero) observer.ReleaseHandle();
+        }
+        private void ContentChanged(object sender,EventArgs e) => UpdateRails();
+        protected override void OnLayout(LayoutEventArgs e) {
+            base.OnLayout(e);
+            UpdateRails();
+        }
+        public void UpdateRails() {
+            if(arranging || horizontal==null || IsDisposed || Disposing || content.IsDisposed) return;
+            arranging=true;
+            try {
+                if(content.Bounds!=ClientRectangle) content.Bounds=ClientRectangle;
+                var visible=Size.Empty;
+                if(content.IsHandleCreated && GetClientRect(content.Handle,out var client))
+                    visible=new Size(Math.Clamp(client.Right,0,Width),Math.Clamp(client.Bottom,0,Height));
+                viewport.Bounds=new Rectangle(Point.Empty,visible);
+                BackColor=viewport.BackColor=content.BackColor;
+                vertical.SetBounds(visible.Width,0,Width-visible.Width,visible.Height);
+                horizontal.SetBounds(0,visible.Height,visible.Width,Height-visible.Height);
+                vertical.Visible=vertical.Width>0 && visible.Height>0;
+                horizontal.Visible=horizontal.Height>0 && visible.Width>0;
+                vertical.Invalidate(); horizontal.Invalidate();
+            } finally { arranging=false; }
+        }
+        private sealed class ScrollObserver : NativeWindow {
+            private readonly HudScrollBar host;
+            internal ScrollObserver(HudScrollBar host) { this.host=host; }
+            protected override void WndProc(ref Message m) {
+                int msg=m.Msg;
+                base.WndProc(ref m);
+                switch(msg) {
+                    case 0x007D: case 0x0047: case 0x0085: // style, position or non-client layout changed
+                        host.UpdateRails(); break;
+                    case 0x000F: case 0x0114: case 0x0115: case 0x020A: case 0x020E:
+                    case 0x0100: case 0x0186: case 0x0197: // key, selection or LB_SETTOPINDEX
+                        host.vertical.Invalidate(); host.horizontal.Invalidate(); break;
+                }
             }
-            Refresh();
         }
-        private void Closed(object sender, EventArgs e) {
-            StopTracking();
-            hot = false;
-            if (Handle != IntPtr.Zero) ReleaseHandle();
+        public bool ScrollKey(Keys key) {
+            if(!vertical.Range(out var t)) return false;
+            int target;
+            switch(key) {
+                case Keys.PageUp: target=t.Pos-t.Page; break;
+                case Keys.PageDown: target=t.Pos+t.Page; break;
+                case Keys.Home: target=t.Min; break;
+                case Keys.End: target=t.Last; break;
+                default: return false;
+            }
+            vertical.ScrollTo(target,t); return true;
         }
-        private void OwnerDisposed(object sender, EventArgs e) => Dispose();
-        public void Dispose() {
-            Closed(null,EventArgs.Empty);
-            owner.HandleDestroyed -= Closed;
-            owner.Disposed -= OwnerDisposed;
-            if (panel != null) panel.HandleCreated -= Attach;
-            if (choices!=null) choices.HandleCreated-=Attach;
-            repeat.Dispose();
+        protected override bool ProcessCmdKey(ref Message m,Keys keyData) {
+            if(content is ScrollableControl && ScrollKey(keyData)) return true;
+            return base.ProcessCmdKey(ref m,keyData);
+        }
+        protected override void Dispose(bool disposing) {
+            if(disposing && observer!=null) {
+                content.HandleCreated-=ContentCreated; content.HandleDestroyed-=ContentDestroyed;
+                content.ClientSizeChanged-=ContentChanged; content.BackColorChanged-=ContentChanged;
+                ContentDestroyed(null,EventArgs.Empty);
+            }
+            base.Dispose(disposing);
         }
 
         private struct Track {
-            public Rectangle Bounds, Thumb;
-            public int Min, Last, Page, Value, Travel, Dpi;
+            internal Rectangle Thumb;
+            internal int Min,Last,Page,Pos,Travel,Pad;
         }
-        private static int Px(int n,int dpi) => Math.Max(1,(int)Math.Round(n*dpi/96.0));
-        private bool Read(out Track t) {
-            t = default;
-            if (colors == null || Handle == IntPtr.Zero || !IsWindowVisible(Handle)) return false;
-            var bar = new BarInfo { Size=Marshal.SizeOf<BarInfo>() };
-            var range = new ScrollInfo { Size=Marshal.SizeOf<ScrollInfo>(), Mask=7 };
-            if (!GetScrollBarInfo(Handle,ObjVertical,ref bar) || (bar.State[0] & 0x18000) != 0 ||
-                !GetScrollInfo(Handle,1,ref range)) return false;
-            t.Bounds = bar.Bounds.Rectangle;
-            t.Min=range.Min; t.Page=Math.Max(1,(int)range.Page);
-            t.Last=range.Max-t.Page+1; t.Value=Math.Clamp(range.Pos,t.Min,Math.Max(t.Min,t.Last));
-            if (t.Last <= t.Min || t.Bounds.Width < 2 || t.Bounds.Height < 4) return false;
-            t.Dpi = owner.DeviceDpi;
-            int pad = Math.Min(Px(3,t.Dpi),t.Bounds.Height/4);
-            int length = t.Bounds.Height-2*pad;
-            int height = Math.Clamp((int)Math.Round(length*(double)t.Page/(range.Max-t.Min+1)),Math.Min(Px(24,t.Dpi),length-1),length-1);
-            t.Travel = length-height;
-            int y = t.Bounds.Top+pad+(int)Math.Round(t.Travel*(double)(t.Value-t.Min)/(t.Last-t.Min));
-            int width = Math.Min(t.Bounds.Width,Px(hot || held ? 7 : 4,t.Dpi));
-            t.Thumb = new Rectangle(t.Bounds.Left+(t.Bounds.Width-width)/2,y,width,height);
-            return true;
-        }
-        private static Color Mix(Color a,Color b,int percent) =>
-            Color.FromArgb((a.R*(100-percent)+b.R*percent)/100,(a.G*(100-percent)+b.G*percent)/100,(a.B*(100-percent)+b.B*percent)/100);
-        public void Refresh() {
-            if (!Read(out var t) || !GetWindowRect(Handle,out var window)) return;
-            IntPtr dc=GetWindowDC(Handle);
-            if (dc == IntPtr.Zero) return;
-            try {
-                using var g = Graphics.FromHdc(dc);
-                g.TranslateTransform(-window.Left,-window.Top);
-                g.SetClip(t.Bounds);
-                using var fill = new SolidBrush(owner.BackColor);
-                g.FillRectangle(fill,t.Bounds);
-                g.SmoothingMode=SmoothingMode.AntiAlias;
-                if (hot || held) {
-                    var rail = t.Thumb;
-                    rail.Y = t.Bounds.Top+Px(2,t.Dpi); rail.Height = Math.Max(1,t.Bounds.Height-2*Px(2,t.Dpi));
-                    using var path = MetricPill.Outline(rail,rail.Width/2f);
-                    using var track = new SolidBrush(colors.Divider); g.FillPath(track,path);
+        private sealed class Rail : Control {
+            private readonly HudScrollBar host;
+            private readonly bool upright;
+            private readonly Timer repeat=new Timer();
+            private bool held,dragging,hot;
+            private int grip;
+            internal Rail(HudScrollBar host,bool upright) {
+                this.host=host; this.upright=upright;
+                Name=upright ? "hud-scroll-vertical" : "hud-scroll-horizontal";
+                AccessibleRole=AccessibleRole.ScrollBar;
+                AccessibleName=upright ? "垂直滚动条" : "水平滚动条";
+                SetStyle(ControlStyles.Selectable,false);
+                DoubleBuffered=true; TabStop=false; Visible=false;
+                repeat.Tick+=(s,e)=>{ repeat.Interval=85; if(held && !dragging && Range(out var t)) PageAt(PointToClient(MousePosition),t); };
+            }
+            private int Px(int n) => Math.Max(1,(int)Math.Round(n*DeviceDpi/96.0));
+            private int Axis(Point p) => upright ? p.Y : p.X;
+            internal bool Range(out Track t) {
+                t=default;
+                int length=upright ? Height : Width, thickness=upright ? Width : Height;
+                if(!Visible || !host.content.IsHandleCreated || length<4 || thickness<1) return false;
+                var info=new ScrollInfo {Size=Marshal.SizeOf<ScrollInfo>(),Mask=7};
+                if(!GetScrollInfo(host.content.Handle,upright ? 1 : 0,ref info)) return false;
+                t.Min=info.Min; t.Page=Math.Max(1,(int)info.Page);
+                t.Last=info.Max-t.Page+1;
+                if(t.Last<=t.Min) return false;
+                t.Pos=Math.Clamp(info.Pos,t.Min,t.Last); t.Pad=Math.Min(Px(3),length/4);
+                int span=length-2*t.Pad;
+                int size=Math.Clamp((int)Math.Round((double)span*t.Page/(info.Max-t.Min+1)),Math.Min(Px(24),span-1),span-1);
+                t.Travel=span-size;
+                int offset=t.Pad+(int)Math.Round(t.Travel*(double)(t.Pos-t.Min)/(t.Last-t.Min));
+                int breadth=Math.Min(thickness,Px(hot || held ? 7 : 4)), side=(thickness-breadth)/2;
+                t.Thumb=upright ? new Rectangle(side,offset,breadth,size) : new Rectangle(offset,side,size,breadth);
+                return true;
+            }
+            protected override void OnPaint(PaintEventArgs e) {
+                var colors=host.palette;
+                var bg=host.content.BackColor;
+                e.Graphics.Clear(bg);
+                if(colors==null || !Range(out var t)) return;
+                e.Graphics.SmoothingMode=SmoothingMode.AntiAlias;
+                int breadth=upright ? t.Thumb.Width : t.Thumb.Height;
+                if(hot || held) {
+                    var rail=upright ? new Rectangle(t.Thumb.X,t.Pad,breadth,Height-2*t.Pad) :
+                        new Rectangle(t.Pad,t.Thumb.Y,Width-2*t.Pad,breadth);
+                    using var path=MetricPill.Outline(rail,breadth/2f);
+                    using var brush=new SolidBrush(colors.Divider);
+                    e.Graphics.FillPath(brush,path);
                 }
-                using var outline = MetricPill.Outline(t.Thumb,t.Thumb.Width/2f);
-                using var thumb = new SolidBrush(held ? colors.Ink : hot ? colors.Muted : Mix(owner.BackColor,colors.Muted,67));
-                g.FillPath(thumb,outline);
-            } finally { ReleaseDC(Handle,dc); }
-        }
-        private void ScrollTo(int value,Track t) {
-            value = Math.Clamp(value,t.Min,t.Last);
-            if (value != t.Value) {
-                if (panel != null) panel.AutoScrollPosition = new Point(-panel.AutoScrollPosition.X,value);
-                else SendMessage(Handle,LbSetTopIndex,(IntPtr)value,IntPtr.Zero);
+                using var outline=MetricPill.Outline(t.Thumb,breadth/2f);
+                using var thumb=new SolidBrush(held ? colors.Ink : hot ? colors.Muted : Color.FromArgb(171,colors.Muted));
+                e.Graphics.FillPath(thumb,outline);
             }
-            Refresh();
-        }
-        public bool ScrollKey(Keys key) {
-            if (!Read(out var t)) return false;
-            int value;
-            switch (key) {
-                case Keys.PageUp: value=t.Value-t.Page; break;
-                case Keys.PageDown: value=t.Value+t.Page; break;
-                case Keys.Home: value=t.Min; break;
-                case Keys.End: value=t.Last; break;
-                default: return false;
-            }
-            ScrollTo(value,t); return true;
-        }
-        private void PageAt(Point pt,Track t) {
-            if (pt.Y < t.Thumb.Top) ScrollTo(t.Value-t.Page,t);
-            else if (pt.Y >= t.Thumb.Bottom) ScrollTo(t.Value+t.Page,t);
-        }
-        private void RepeatPage(object sender,EventArgs e) {
-            repeat.Interval=85;
-            if (held && !dragging && Read(out var t) && t.Bounds.Contains(Cursor.Position)) PageAt(Cursor.Position,t);
-        }
-        private void StopTracking() {
-            repeat.Stop();
-            if (!held) return;
-            held=dragging=false;
-            if (GetCapture()==Handle && previousCapture!=Handle) {
-                ReleaseCapture();
-            }
-            previousCapture=IntPtr.Zero;
-        }
-        private static Point Pointer(Message m,bool client) {
-            long xy=m.LParam.ToInt64();
-            var pt=new Point((short)xy,(short)(xy>>16));
-            if (client) ClientToScreen(m.HWnd,ref pt);
-            return pt;
-        }
-        protected override void WndProc(ref Message m) {
-            bool move=m.Msg==MouseMove || m.Msg==NcMouseMove;
-            bool down=m.Msg==LeftDown || m.Msg==NcLeftDown || m.Msg==LeftDouble || m.Msg==NcLeftDouble;
-            bool up=m.Msg==LeftUp || m.Msg==NcLeftUp;
-            if (up && held) {
-                Point pt=Pointer(m,m.Msg==LeftUp);
-                StopTracking();
-                hot=Read(out var track) && track.Bounds.Contains(pt);
-                Refresh(); m.Result=IntPtr.Zero; return;
-            }
-            if (move || down) {
-                Point pt=Pointer(m,m.Msg>=MouseMove && m.Msg<=LeftDouble);
-                if (Read(out var t) && (held || t.Bounds.Contains(pt))) {
-                    if (!hot) {
-                        hot=true;
-                        const uint leave=2, nonClient=16;
-                        var track=new MouseTrack { Size=Marshal.SizeOf<MouseTrack>(), Flags=m.Msg>=MouseMove ? leave : leave|nonClient, Window=Handle };
-                        TrackMouseEvent(ref track);
-                    }
-                    if (down) {
-                        dragging=pt.Y>=t.Thumb.Top && pt.Y<t.Thumb.Bottom;
-                        gripOffset=pt.Y-t.Thumb.Top;
-                        previousCapture=GetCapture(); held=true;
-                        if (previousCapture!=Handle) SetCapture(Handle);
-                        if (!dragging) { PageAt(pt,t); repeat.Interval=400; repeat.Start(); }
-                    } else if (move && held && dragging) {
-                        int start=t.Bounds.Top+Math.Min(Px(3,t.Dpi),t.Bounds.Height/4);
-                        double fraction=Math.Clamp((pt.Y-gripOffset-start)/(double)t.Travel,0,1);
-                        ScrollTo(t.Min+(int)Math.Round(fraction*(t.Last-t.Min)),t);
-                    }
-                    Refresh(); m.Result=IntPtr.Zero; return;
+            internal void ScrollTo(int value,Track t) {
+                value=Math.Clamp(value,t.Min,t.Last);
+                if(value!=t.Pos) {
+                    if(host.content is ScrollableControl sc) {
+                        var old=sc.AutoScrollPosition;
+                        sc.AutoScrollPosition=upright ? new Point(-old.X,value) : new Point(value,-old.Y);
+                    } else SendMessage(host.content.Handle,0x0197,(IntPtr)value,IntPtr.Zero);
                 }
-                if (hot && !held) { hot=false; Refresh(); }
+                Invalidate();
             }
-            if (m.Msg==0x0215 || m.Msg==0x001F || (m.Msg==0x0018 && m.WParam==IntPtr.Zero))
-                StopTracking(); // capture changed, cancel or hide while dragging
-            if (m.Msg==0x02A2 || m.Msg==0x02A3) hot=false;
-            int msg=m.Msg;
-            base.WndProc(ref m);
-            switch (msg) {
-                case 0x000F: case 0x0085: case 0x0086: case 0x0047: // paint, non-client paint/activation, resize
-                case 0x0115: case 0x020A: case 0x0100: case 0x0101: // scroll, wheel, keyboard
-                case LbSetTopIndex: case 0x0186: case 0x0215: case 0x02A2: case 0x02A3:
-                    Refresh(); break;
+            private void PageAt(Point pt,Track t) {
+                if(!ClientRectangle.Contains(pt)) return;
+                int pos=Axis(pt), start=Axis(t.Thumb.Location);
+                if(pos<start) ScrollTo(t.Pos-t.Page,t);
+                else if(pos>=start+(upright ? t.Thumb.Height : t.Thumb.Width)) ScrollTo(t.Pos+t.Page,t);
             }
+            protected override void OnMouseDown(MouseEventArgs e) {
+                base.OnMouseDown(e);
+                if(e.Button!=MouseButtons.Left || !Range(out var t)) return;
+                int pos=Axis(e.Location), start=Axis(t.Thumb.Location);
+                dragging=pos>=start && pos<start+(upright ? t.Thumb.Height : t.Thumb.Width);
+                grip=pos-start; held=true; Capture=true;
+                if(!dragging) { PageAt(e.Location,t); repeat.Interval=400; repeat.Start(); }
+                Invalidate();
+            }
+            protected override void OnMouseMove(MouseEventArgs e) {
+                base.OnMouseMove(e);
+                if(!held || !dragging || !Range(out var t)) return;
+                double ratio=Math.Clamp((Axis(e.Location)-grip-t.Pad)/(double)t.Travel,0,1);
+                ScrollTo(t.Min+(int)Math.Round(ratio*(t.Last-t.Min)),t);
+            }
+            protected override void OnMouseUp(MouseEventArgs e) {
+                base.OnMouseUp(e);
+                if(e.Button==MouseButtons.Left && held) Capture=false;
+            }
+            protected override void OnMouseCaptureChanged(EventArgs e) {
+                base.OnMouseCaptureChanged(e);
+                if(!Capture) { repeat.Stop(); held=dragging=false; Invalidate(); }
+            }
+            protected override void OnVisibleChanged(EventArgs e) {
+                base.OnVisibleChanged(e);
+                if(!Visible && held) Capture=false;
+            }
+            protected override void OnMouseEnter(EventArgs e) { base.OnMouseEnter(e); hot=true; Invalidate(); }
+            protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); hot=false; Invalidate(); }
+            protected override void OnMouseWheel(MouseEventArgs e) {
+                if(!host.content.IsHandleCreated) return;
+                var pt=PointToScreen(e.Location);
+                SendMessage(host.content.Handle,0x020A,(IntPtr)(e.Delta<<16),(IntPtr)((pt.X&0xffff)|(pt.Y<<16)));
+                if(e is HandledMouseEventArgs handled) handled.Handled=true;
+            }
+            protected override void Dispose(bool disposing) { if(disposing) repeat.Dispose(); base.Dispose(disposing); }
         }
-        private const int ObjVertical=-5, LbSetTopIndex=0x0197;
-        private const int MouseMove=0x200,LeftDown=0x201,LeftUp=0x202,LeftDouble=0x203;
-        private const int NcMouseMove=0xA0,NcLeftDown=0xA1,NcLeftUp=0xA2,NcLeftDouble=0xA3;
-        [StructLayout(LayoutKind.Sequential)] private struct Rect {
-            public int Left,Top,Right,Bottom;
-            public Rectangle Rectangle => Rectangle.FromLTRB(Left,Top,Right,Bottom);
-        }
-        [StructLayout(LayoutKind.Sequential)] private struct BarInfo {
-            public int Size; public Rect Bounds; public int Button,ThumbTop,ThumbBottom,Reserved;
-            [MarshalAs(UnmanagedType.ByValArray,SizeConst=6)] public int[] State;
-        }
+
+        [StructLayout(LayoutKind.Sequential)] private struct Rect { public int Left,Top,Right,Bottom; }
         [StructLayout(LayoutKind.Sequential)] private struct ScrollInfo {
             public int Size,Mask,Min,Max; public uint Page; public int Pos,TrackPos;
         }
-        [StructLayout(LayoutKind.Sequential)] private struct MouseTrack {
-            public int Size; public uint Flags; public IntPtr Window; public uint HoverTime;
-        }
-        [DllImport("user32")] private static extern bool GetScrollBarInfo(IntPtr h,int id,ref BarInfo info);
         [DllImport("user32")] private static extern bool GetScrollInfo(IntPtr h,int bar,ref ScrollInfo info);
-        [DllImport("user32")] private static extern IntPtr GetWindowDC(IntPtr h);
-        [DllImport("user32")] private static extern int ReleaseDC(IntPtr h,IntPtr dc);
-        [DllImport("user32")] private static extern bool GetWindowRect(IntPtr h,out Rect rect);
+        [DllImport("user32")] private static extern bool GetClientRect(IntPtr h,out Rect rect);
         [DllImport("user32")] private static extern int GetSystemMetricsForDpi(int index,uint dpi);
-        [DllImport("user32")] private static extern bool IsWindowVisible(IntPtr h);
-        [DllImport("user32")] private static extern bool ClientToScreen(IntPtr h,ref Point pt);
-        [DllImport("user32")] private static extern bool TrackMouseEvent(ref MouseTrack t);
-        [DllImport("user32")] private static extern IntPtr GetCapture();
-        [DllImport("user32")] private static extern IntPtr SetCapture(IntPtr h);
-        [DllImport("user32")] private static extern bool ReleaseCapture();
         [DllImport("user32")] private static extern IntPtr SendMessage(IntPtr h,int msg,IntPtr w,IntPtr l);
     }
 }

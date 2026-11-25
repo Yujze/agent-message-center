@@ -17,7 +17,7 @@ namespace JieShou {
         }
     }
 
-    public enum HudGlyph { None, All, Clock, Sort, Settings, Collapse, Previous, Next }
+    public enum HudGlyph { None, All, Clock, Sort, Settings, Collapse, Down, Previous, Next }
 
     // Keep the native button interaction, keyboard focus and AutomationId while
     // painting the same chrome across Windows themes and monitor scales.
@@ -119,6 +119,8 @@ namespace JieShou {
                         break;
                     case HudGlyph.Collapse:
                         g.DrawLines(p,new[]{new Point(3,11),new Point(9,5),new Point(15,11)}); break;
+                    case HudGlyph.Down:
+                        g.DrawLines(p,new[]{new Point(3,6),new Point(9,12),new Point(15,6)}); break;
                     case HudGlyph.Previous:
                         g.DrawLines(p,new[]{new Point(11,3),new Point(5,9),new Point(11,15)}); break;
                     case HudGlyph.Next:
