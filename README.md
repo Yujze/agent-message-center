@@ -4,11 +4,11 @@ Agent Message Center 是一个 Windows 桌面浮窗。写代码或处理文档�
 
 ## 下载与启动
 
-**安装版**适合日常使用。双击 MSI 为当前用户安装，然后在开始菜单搜索「智能体消息中心」。需要卸载时，打开 Windows「设置 → 应用 → 已安装的应用」，找到 Agent Message Center。[下载 Windows x64 安装包](https://github.com/Yujze/agent-message-center/releases/download/v0.2.0-beta.3/AMC-v0.2.0-beta.3-windows-x64.msi)
+**安装版**适合日常使用。双击 MSI 为当前用户安装，然后在开始菜单搜索「智能体消息中心」。需要卸载时，打开 Windows「设置 → 应用 → 已安装的应用」，找到 Agent Message Center。[下载 Windows x64 安装包](https://github.com/Yujze/agent-message-center/releases/download/v0.2.0-beta.4/AMC-v0.2.0-beta.4-windows-x64.msi)
 
-**便携版**适合解压即用。把整个 ZIP 解压到一个文件夹，再双击其中的 `AMC.exe`。[下载 Windows x64 便携包](https://github.com/Yujze/agent-message-center/releases/download/v0.2.0-beta.3/AMC-v0.2.0-beta.3-windows-x64-portable.zip)
+**便携版**适合解压即用。把整个 ZIP 解压到一个文件夹，再双击其中的 `AMC.exe`。[下载 Windows x64 便携包](https://github.com/Yujze/agent-message-center/releases/download/v0.2.0-beta.4/AMC-v0.2.0-beta.4-windows-x64-portable.zip)
 
-两种包都包含 PowerShell 和 Python。按住气泡图标可移动浮窗，右键系统托盘里的 AMC 图标可退出。Release 附件中各有一份同名 `.sha256` 文件，可用 `Get-FileHash` 核对。[全部发布文件](https://github.com/Yujze/agent-message-center/releases/tag/v0.2.0-beta.3)
+两种包都包含 PowerShell 和 Python。按住气泡图标可移动浮窗，右键系统托盘里的 AMC 图标可退出。Release 附件中各有一份同名 `.sha256` 文件，可用 `Get-FileHash` 核对。[全部发布文件](https://github.com/Yujze/agent-message-center/releases/tag/v0.2.0-beta.4)
 
 ## 会话列表
 
@@ -20,7 +20,7 @@ Agent Message Center 是一个 Windows 桌面浮窗。写代码或处理文档�
 | DeepSeek Harness（DSH） | 读取桌面工作区和会话投影；点击会话时在 DSH 侧栏定位唯一匹配的完整标题。 |
 | Qoder | 合并独立桌面版和 IDE 的本地会话，按 ID 去重。独立版可按 ID 跳转，只有 IDE 记录的会话可在 AMC 中查看。 |
 
-胶囊统计跟随列表筛选。拖到屏幕上、下边缘会显示横向分段胶囊，拖到左、右边缘会显示竖向窄边数字栏，松手时切换。竖向胶囊左列显示待输入、完成未读和进行中的数量，右列显示状态，底部分两行列出总数和已完成数。在「胶囊外观 → 胶囊模式」中，极简模式每项一行。丰富模式补充来源，单一 Agent 显示图标和名称，多个 Agent 分别显示图标和数量。拖动竖向胶囊顶部的握槽、横向胶囊的消息徽标或完整列表的标题栏可移动浮窗。点击「已完成」只看当前范围内的已完成会话，点击横向的「任务」、竖向的「总数」或展开箭头查看全部会话。提醒分类清零后会在当前页显示「已处理完」。设置中的「关于」页展示 AMC 徽标和英文全称 Agent Message Center。
+胶囊统计跟随列表筛选。拖到屏幕上、下边缘会显示横向分段胶囊，拖到左、右边缘会显示竖向窄边数字栏，松手时切换。竖向胶囊左列显示待输入、完成未读和进行中的数量，右列显示状态，底部分两行列出总数和已完成数。在「胶囊外观 → 胶囊模式」中，极简模式每项一行。丰富模式补充来源，单一 Agent 显示图标和名称，多个 Agent 分别显示图标和数量。拖动竖向胶囊顶部的握槽、横向胶囊的消息徽标或完整列表的标题栏可移动浮窗。点击「已完成」只看当前范围内的已完成会话，点击横向的「任务」、竖向的「总数」或展开箭头查看全部会话。提醒分类清零后会在当前页显示「已处理完」。设置页在宽屏上并排显示选项，在窄屏上只滚动内容，导航和保存按钮始终可见。进入「关于」可查看当前版本。
 
 每条边分三段，默认停在主屏底边的右段。「外观设置 → 位置与方向」可在所选屏幕的预览边缘点选 12 个位置，也可以记住上次拖动的屏幕和位置。指定屏幕断开时暂用主屏。
 
@@ -50,7 +50,7 @@ MSI 使用同版本便携 ZIP 作为输入。将 WiX 4 安装到构建缓存后�
 
 ```powershell
 dotnet tool install wix --version 4.0.6 --tool-path .\.cache\wix4
-python .\packaging\build_msi.py .\dist\AMC-v0.2.0-beta.3-windows-x64-portable.zip --wix .\.cache\wix4\wix.exe
+python .\packaging\build_msi.py .\dist\AMC-v0.2.0-beta.4-windows-x64-portable.zip --wix .\.cache\wix4\wix.exe
 ```
 
 源码测试使用临时会话数据。在 `app/` 目录运行：
